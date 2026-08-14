@@ -1,0 +1,30 @@
+[project]
+name = "parsing-service"
+version = "0.1.0"
+description = "Document parsing service — raw uploads to structured content"
+requires-python = ">=3.10"
+dependencies = [
+    "pydantic>=2.6",
+    "PyYAML>=6.0",
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+# Each parser's dependency is optional: a deployment that never sees a DOCX
+# should not need python-docx, and the registry degrades to a clean
+# "unsupported_format" rejection rather than an ImportError in the worker.
+docx = ["python-docx>=1.1"]
+pdf = ["pypdfium2>=4.30", "pdfplumber>=0.11"]
+xlsx = ["openpyxl>=3.1"]
+ocr = ["pytesseract>=0.3.10", "Pillow>=10.0"]
+api = ["fastapi>=0.110", "uvicorn>=0.29"]
+dev = ["pytest>=8.0"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.ruff]
+line-length = 92
+target-version = "py310"
