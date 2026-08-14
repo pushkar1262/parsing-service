@@ -10,6 +10,8 @@ that takes the worker down on an unlucky message.
 from __future__ import annotations
 
 from parse.base import Parser, UnsupportedFormat
+from parse.csv import CsvParser
+from parse.html import HtmlParser
 from parse.text import TextParser
 
 
@@ -56,15 +58,60 @@ def default_registry() -> Registry:
     """
     registry = Registry()
     registry.register(TextParser())
+    registry.register(HtmlParser())
+    registry.register(CsvParser())
 
-    try:
-        from parse.docx import DocxParser
-    except ImportError as exc:  # pragma: no cover - depends on the environment
-        registry.mark_unavailable(
-            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            f"python-docx is not installed ({exc})",
-        )
-    else:
-        registry.register(DocxParser())
-
+    _try(
+        registry,
+        "parse.docx",
+        "DocxParser",
+        ("application/vnd.openxmlformats-officedocument.wordprocessingml.document",),
+        "python-docx",
+        "docx",
+    )
+    _try(
+        registry,
+        "parse.pdf",
+        "PdfParser",
+        ("application/pdf",),
+        "pypdfium2",
+        "pdf",
+    )
+    _try(
+        registry,
+        "parse.xlsx",
+        "XlsxParser",
+        ("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",),
+        "openpyxl",
+        "xlsx",
+    )
     return registry
+
+
+def _try(
+    registry: Registry,
+    module: str,
+    attribute: str,
+    media_types: tuple[str, ...],
+    package: str,
+    extra: str,
+) -> None:
+    """Register a parser, or record why it is unavailable.
+
+    The `except ImportError` is the whole point: importing this module must never fail
+    because of a format this deployment does not handle, and an operator seeing
+    "install parsing-service[pdf]" fixes it in a minute where an ImportError traceback
+    from inside a worker sends them reading our source.
+    """
+    try:
+        imported = __import__(module, fromlist=[attribute])
+        parser = getattr(imported, attribute)()
+    except ImportError as exc:  # pragma: no cover - depends on the environment
+        for media_type in media_types:
+            registry.mark_unavailable(
+                media_type,
+                f"{package} is not installed ({exc}); "
+                f"install parsing-service[{extra}]",
+            )
+    else:
+        registry.register(parser)

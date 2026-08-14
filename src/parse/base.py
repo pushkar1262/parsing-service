@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
 from domain.document import BlockType, PageSource, ParseWarning, TableData
+from domain.errors import CorruptDocument, EncryptedDocument, UnsupportedFormat
 
 
 @dataclass
@@ -95,15 +96,15 @@ class Parser(Protocol):
     def parse(self, data: bytes, *, filename: str | None = None) -> ParseResult: ...
 
 
-class UnsupportedFormat(Exception):
-    """Permanent failure: no parser claims this media type.
-
-    Distinct from `CorruptDocument` because they route differently in intake — both
-    skip retry, but only one of them means "the file is broken", and telling a user
-    "we do not support .pages files" is a different message from "your PDF is
-    truncated".
-    """
-
-
-class CorruptDocument(Exception):
-    """Permanent failure: the right parser could not open the bytes."""
+# Re-exported so a parser only ever imports from `parse.base`, while the taxonomy
+# itself lives in `domain.errors` — intake routes on `transient` and `failure_class`,
+# and those must mean the same thing for a fetch failure as for a parse failure.
+__all__ = [
+    "CorruptDocument",
+    "EncryptedDocument",
+    "PageInfo",
+    "ParseResult",
+    "Parser",
+    "RawBlock",
+    "UnsupportedFormat",
+]

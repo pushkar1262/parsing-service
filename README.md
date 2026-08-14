@@ -7,13 +7,16 @@ API is the only path from a raw upload to document content.
 Full design, including the parts not built yet: [DESIGN.md](DESIGN.md).
 
 ```bash
-pip install -e ".[dev,docx]"
-python -m pytest -q                              # 92 tests, all offline
+pip install -e ".[dev,docx,pdf,xlsx,s3]"
+python -m pytest -q                       # 167 tests, all offline
 
-python examples/parse_file.py spec.docx          # structure outline + metadata
-python examples/parse_file.py spec.docx --text   # the canonical text
-python examples/parse_file.py spec.docx --json   # the full artifact
-python examples/parse_file.py spec.docx --locate "authenticate users within 300ms"
+python examples/parse_file.py spec.pdf                        # outline + metadata
+python examples/parse_file.py spec.pdf --text                 # the canonical text
+python examples/parse_file.py spec.pdf --json                 # the full artifact
+python examples/parse_file.py spec.pdf --locate "authenticate users"
+
+python examples/parse_file.py s3://acme-uploads/raw/spec.pdf   # via boto3
+python examples/parse_file.py "https://...presigned-url..."    # via plain HTTP
 ```
 
 ## What is built
@@ -24,17 +27,18 @@ python examples/parse_file.py spec.docx --locate "authenticate users within 300m
 | Canonical text + spans (`parse/serialize.py`) | ✅ |
 | Normalisation — de-hyphenation, NFKC, invisibles | ✅ |
 | Byte-sniffing format detection | ✅ |
-| Plain text / Markdown parser | ✅ |
-| DOCX parser | ✅ |
+| Plain text / Markdown · DOCX · **PDF** · **XLSX** · **HTML** · **CSV** | ✅ |
 | Quote lookup (`domain/locate.py`) | ✅ |
-| PDF, OCR, XLSX | ⬜ |
+| **Fetch from S3, presigned URLs, local — with SSRF guards and size caps** | ✅ |
+| OCR backend (pages are detected and flagged; text not yet extracted) | ⬜ |
+| PDF table extraction | ⬜ |
 | Postgres + S3 persistence, status machine | ⬜ |
 | Kafka intake, retry tiers, DLQ | ⬜ |
 | HTTP API | ⬜ |
 
-Everything built so far is pure: bytes in, artifact out, no I/O. That is what lets
-the whole parse stage be tested without infrastructure, and it is what makes replay
-safe once the worker exists.
+The parse stage stays pure — bytes in, artifact out, no I/O — which is what lets it be
+tested without infrastructure and what makes job replay safe. Fetching is a separate
+layer (`src/store/`) so that property survives.
 
 ## The one idea worth knowing
 
@@ -97,26 +101,78 @@ Three things a local `quote in text` cannot give you:
   attribution a coin flip, and the caller should know rather than receive the first
   hit as though it were the only one.
 
+## Fetching the raw file
+
+Jobs reference documents as `s3://bucket/key`, as a presigned `https://` URL, or as a
+local path. `s3://` uses the worker's IAM role; a presigned URL is fetched with no
+credentials, because the signature in the query string *is* the authorisation.
+
+Three properties matter more than the plumbing:
+
+- **The size cap is counted byte by byte**, never taken from `Content-Length`. A declared
+  length is a claim, and a lying or absent one would otherwise be an OOM in a worker.
+- **Failures are classified.** A 5xx is transient and walks the retry tiers; a 404 or an
+  expired signature is permanent and goes to the DLQ with a reason. `ServiceError`
+  carries `transient` and `failure_class` so the worker never has to guess.
+- **URLs are checked against the addresses they resolve to** — see below.
+
+### The SSRF guard
+
+A URL arriving in a job message traces back to something a user influenced. Without a
+guard, `http://169.254.169.254/latest/meta-data/iam/security-credentials/` makes the
+worker fetch its *own IAM credentials*, parse them as a document, store them as parsed
+content, and serve them over the content API. Credential exfiltration dressed as a text
+file. So `store/net.py`:
+
+- resolves the hostname and rejects unless **every** resolved address is public — a
+  public-looking name proves nothing, since an attacker controls their own DNS;
+- **refuses redirects**, since a 302 to the metadata address defeats a check applied only
+  to the original URL;
+- allows `https` only, with an optional host allowlist;
+- has an explicit `allow_private_networks` escape hatch for deployments behind an S3 VPC
+  endpoint, off by default.
+
+The residual DNS-rebinding window is documented in that module rather than papered over.
+
 ## Layout
 
 ```
 src/domain/
   document.py     ParsedDocument, Block, Page, Metadata — the contract
+  errors.py       one failure taxonomy: transient vs permanent, failure_class
   locate.py       quote → span, page, block, snapped source text
 src/parse/
-  base.py         RawBlock, Parser protocol, failure taxonomy
+  base.py         RawBlock, Parser protocol
   serialize.py    ★ block tree → canonical text + spans
   normalise.py    de-hyphenation, NFKC, invisible characters, decoding
   detect.py       format from magic bytes and zip contents
-  text.py         plain text and Markdown
-  docx.py         DOCX
+  text.py docx.py pdf.py xlsx.py html.py csv.py
   registry.py     media type → parser, tolerant of missing optional deps
   pipeline.py     bytes → ParsedDocument
-tests/            92 tests; fixtures are readable strings, not binaries
+src/store/
+  refs.py         s3:// · presigned https:// · file:// → a typed reference
+  net.py          the SSRF guard
+  blobs.py        fetch with size caps, streaming hash, classified failures
+tests/            167 tests; fixtures are generated in code, not binary blobs
 ```
 
 `serialize.py` is the file to guard hardest: it is the only place spans are produced,
 and its bugs are the kind that keep all the content while moving the offsets.
+
+## A note on PDF
+
+Everything a PDF parser knows is inferred — the file contains glyphs at coordinates, not
+headings. Two things this parser does that are easy to get wrong:
+
+Font size is read with `FPDFText_GetFontSize`, not measured from the glyph box. Measured
+by glyph height, "Registration" and "Performance" at the same 14pt come out as 8.59 and
+7.73 — a 10% gap caused only by the descender in "g" — which ranks two sibling headings as
+two different levels and nests one section inside the other.
+
+A page is flagged for OCR only when it has thin text **and** contains an image. Thin text
+alone is a section divider or a short page, and flagging it would both cry wolf and route
+a readable page into the OCR lane at 10-100x the cost. A page with neither text nor images
+is reported as `blank_page`, because a broken export and a scan need different responses.
 
 ## Conventions
 
