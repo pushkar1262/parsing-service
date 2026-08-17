@@ -25,7 +25,9 @@ points at nothing, which the content API would answer with a 500.
 
 from __future__ import annotations
 
+import functools
 import json
+import threading
 import uuid
 from datetime import timedelta
 from pathlib import Path
@@ -108,6 +110,16 @@ class PostgresRepository:
         self._connection = connection
         self._clock = clock
         self._tenant: str | None = None
+        # One connection, and `_tenant` is instance state that every statement reads. Two
+        # concurrent requests would otherwise interleave on both: request A sets its
+        # tenant, request B overwrites it, and A's query runs scoped to B. Every public
+        # method is wrapped so the tenant, the statements and the commit are one unit.
+        #
+        # This serialises database access, which is fine for the worker (one document at a
+        # time) and a throughput ceiling for the API. The upgrade is `psycopg_pool` with a
+        # connection per request; the lock is what makes a shared connection *correct*
+        # rather than fast.
+        self._lock = threading.RLock()
 
     # ------------------------------------------------------------ RLS context
 
@@ -510,3 +522,37 @@ def _is_unique_violation(exc: Exception) -> bool:
     """
     sqlstate = getattr(exc, "sqlstate", None) or getattr(exc, "pgcode", None)
     return str(sqlstate) == "23505"
+
+
+def _synchronized(method):
+    """Hold the repository lock for the whole method.
+
+    Applied to every public method below rather than to individual statements, because the
+    unit that must not interleave is `set_config` + the statements + the commit. Guarding
+    only the query would still let another request change the tenant between the two.
+    """
+
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+
+    return wrapper
+
+
+for _name in (
+    "register",
+    "get",
+    "get_many",
+    "claim",
+    "mark_deleted",
+    "find_run",
+    "start_run",
+    "get_run",
+    "runs_for",
+    "complete_run",
+    "fail_run",
+    "reclaim_expired",
+    "migrate",
+):
+    setattr(PostgresRepository, _name, _synchronized(getattr(PostgresRepository, _name)))

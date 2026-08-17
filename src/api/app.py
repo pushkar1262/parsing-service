@@ -81,12 +81,24 @@ def get_tenant(request: Request) -> str | None:
     the existing tests work. `REQUIRE_TENANT_HEADER=true` turns that off for a deployment
     that is genuinely multi-tenant and would rather fail than serve broadly.
     """
-    tenant = (request.headers.get("x-tenant-id") or "").strip()
-    if tenant:
-        return tenant
-    if getattr(request.app.state, "require_tenant", False):
+    tenant = (request.headers.get("x-tenant-id") or "").strip() or None
+    if tenant is None and getattr(request.app.state, "require_tenant", False):
         raise HTTPException(400, "X-Tenant-Id is required")
-    return None
+
+    # Apply it to the repository before any handler runs. This is a side effect in a
+    # dependency, which is not free of cost, but it is the only point where the request's
+    # tenant becomes known and everything downstream needs it applied: on Postgres the
+    # tenant reaches the session as `app.tenant_id`, and without it the row-level security
+    # policies match nothing and every read returns 404 for a document that plainly exists.
+    #
+    # Found exactly that way — the worker called `use_tenant` and the API did not, so the
+    # API returned 404 for a document it had just written. No test caught it, because the
+    # in-memory repository has no RLS to fail closed.
+    services = getattr(request.app.state, "services", None)
+    scope = getattr(getattr(services, "repository", None), "use_tenant", None)
+    if scope is not None:
+        scope(tenant)
+    return tenant
 
 
 # The Annotated form rather than `svc: Services = Depends(...)`: it is FastAPI's current
