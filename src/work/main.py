@@ -196,11 +196,96 @@ def check(settings: Settings) -> int:
     else:
         print("database : not configured (in-memory)")
 
-    print(
-        "queue    : "
-        + (settings.kafka_bootstrap_servers or "not configured (no retries or DLQ)")
-    )
+    if not check_queue(settings):
+        ok = False
     return 0 if ok else 1
+
+
+def check_queue(settings: Settings) -> bool:
+    """Probe the broker properly, because "the string is set" proves nothing.
+
+    Three things go wrong here and only one of them is obvious:
+
+    The **advertised listener** trap. A broker started with
+    `advertised.listeners=PLAINTEXT://localhost:9092` answers a metadata request from
+    anywhere, then tells the client the broker lives at `localhost` — so bootstrap
+    succeeds, topics list fine, and every produce and consume then fails connecting to
+    127.0.0.1. It looks like the client is broken. Comparing the bootstrap host against
+    what the broker advertises catches it in one line.
+
+    The **missing topic**. Subscribing to a topic nobody publishes to is a worker that
+    starts cleanly, logs nothing and processes nothing forever.
+
+    Plain unreachability, which is the case people expect.
+    """
+    if not settings.kafka_bootstrap_servers:
+        print("queue    : not configured (no retries, no dead-letter queue)")
+        return True
+
+    try:
+        from confluent_kafka.admin import AdminClient
+    except ImportError as exc:
+        print(f"queue    : FAIL — confluent-kafka is not installed ({exc})", file=sys.stderr)
+        return False
+
+    try:
+        client = AdminClient(
+            {
+                "bootstrap.servers": settings.kafka_bootstrap_servers,
+                "socket.timeout.ms": 8000,
+            }
+        )
+        metadata = client.list_topics(timeout=10)
+    except Exception as exc:  # noqa: BLE001 - report, do not crash the check
+        print(
+            f"queue    : FAIL — cannot reach {settings.kafka_bootstrap_servers}: {exc}",
+            file=sys.stderr,
+        )
+        return False
+
+    advertised = sorted({f"{b.host}:{b.port}" for b in metadata.brokers.values()})
+    print(f"queue    : reachable at {settings.kafka_bootstrap_servers}")
+    print(f"           broker advertises {', '.join(advertised)}")
+
+    ok = True
+    bootstrap_hosts = {
+        hp.split(":")[0] for hp in settings.kafka_bootstrap_servers.split(",")
+    }
+    loopback = {"localhost", "127.0.0.1", "::1"}
+    if not (bootstrap_hosts & loopback) and any(
+        broker.host in loopback for broker in metadata.brokers.values()
+    ):
+        print(
+            "           FAIL — the broker advertises a loopback address, so this client\n"
+            "           can read metadata but every produce and consume will connect to\n"
+            "           127.0.0.1 and be refused. Fix on the broker:\n"
+            "             advertised.listeners=PLAINTEXT://"
+            f"{sorted(bootstrap_hosts)[0]}:9092",
+            file=sys.stderr,
+        )
+        ok = False
+
+    topics = sorted(t for t in metadata.topics if not t.startswith("__"))
+    wanted = settings.kafka_topic_requested
+    if wanted in topics:
+        partitions = len(metadata.topics[wanted].partitions)
+        print(f"           topic {wanted!r}: {partitions} partition(s)")
+        if partitions == 1:
+            print(
+                "           note — one partition caps the worker pool at one consumer. "
+                "Raising it later breaks per-key ordering for in-flight keys."
+            )
+    else:
+        print(
+            f"           FAIL — topic {wanted!r} does not exist, so the worker would "
+            f"consume nothing.\n"
+            f"           Topics on this broker: {', '.join(topics) or '(none)'}\n"
+            f"           Set KAFKA_TOPIC_REQUESTED to whichever one the upload backend "
+            f"publishes to.",
+            file=sys.stderr,
+        )
+        ok = False
+    return ok
 
 
 def run_one(settings: Settings, job: Job) -> int:

@@ -11,8 +11,9 @@ pip install -e ".[dev,docx,pdf,xlsx,s3,api,db,kafka]"
 cp .env.example .env                      # then fill in S3_BUCKET and AWS_REGION
 python -m pytest -q                       # 258 tests, all offline
 
-PYTHONPATH=src python -m work.main --check         # resolve config, reach S3 and the DB
+PYTHONPATH=src python -m work.main --check         # preflight: S3, DB, broker, topic
 PYTHONPATH=src python -m work.main                 # consume events and parse
+PYTHONPATH=src python -m work.main --once          # one message, then exit
 uvicorn api.main:app --app-dir src --port 8000     # serve parsed content
 
 python examples/parse_file.py spec.pdf                        # outline + metadata
@@ -157,6 +158,16 @@ Try it without a broker:
 ```bash
 PYTHONPATH=src python -m work.main --event event.json
 ```
+
+`--check` is the preflight worth running first. It resolves the config, does a
+`HeadBucket`, connects to the database, and probes the broker — including two failures
+that otherwise look like a broken client:
+
+- **the topic does not exist**, so the worker would start cleanly, log nothing, and
+  process nothing forever;
+- **the broker advertises a loopback address**, so metadata requests succeed while every
+  produce and consume connects to `127.0.0.1` and is refused. Fixed on the broker with
+  `advertised.listeners=PLAINTEXT://<its-own-ip>:9092`, not in this client.
 
 ## Tenancy
 
