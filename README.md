@@ -8,7 +8,12 @@ Full design, including the parts not built yet: [DESIGN.md](DESIGN.md).
 
 ```bash
 pip install -e ".[dev,docx,pdf,xlsx,s3,api,db,kafka]"
-python -m pytest -q                       # 232 tests, all offline
+cp .env.example .env                      # then fill in S3_BUCKET and AWS_REGION
+python -m pytest -q                       # 258 tests, all offline
+
+PYTHONPATH=src python -m work.main --check         # resolve config, reach S3 and the DB
+PYTHONPATH=src python -m work.main                 # consume events and parse
+uvicorn api.main:app --app-dir src --port 8000     # serve parsed content
 
 python examples/parse_file.py spec.pdf                        # outline + metadata
 python examples/parse_file.py spec.pdf --text                 # the canonical text
@@ -38,6 +43,7 @@ python examples/parse_file.py "https://...presigned-url..."    # via plain HTTP
 | HTTP API — status, batch, content, text, locate, reprocess, delete | ✅ |
 | Postgres repository + migrations | ⚠️ written, needs a live DB to verify |
 | Kafka/Redpanda adapter | ⚠️ written, needs a broker to verify |
+| Config from `.env`, worker and API entrypoints | ✅ |
 | Cleanup worker for the delete cascade | ⬜ |
 | Metrics endpoint, tracing | ⬜ |
 

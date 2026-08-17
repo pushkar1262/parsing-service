@@ -85,6 +85,7 @@ class Worker:
         publisher: Publisher | None = None,
         registry: Registry | None = None,
         parser_version: str = "1.0",
+        resolve_reference: Callable[[str], str] | None = None,
         on_event: Callable[[str, dict[str, Any]], None] | None = None,
     ) -> None:
         self.repository = repository
@@ -95,13 +96,18 @@ class Worker:
         # Stamped on every run and part of the idempotency key, so cutting a new version
         # is what makes a backfill reparse rather than skip.
         self.parser_version = parser_version
+        # A queue message may carry a bare S3 key rather than a full URI, and `parse_ref`
+        # would read that as a local filesystem path. Resolution happens here, once, so no
+        # entrypoint has to remember to do it.
+        self._resolve = resolve_reference or (lambda reference: reference)
         self._on_event = on_event or (lambda name, fields: None)
 
     # ------------------------------------------------------------------ main
 
     def process(self, job: Job) -> Outcome:
+        reference = self._resolve(job.reference)
         self.repository.register(
-            job.document_id, source_uri=job.reference, media_type=job.media_type
+            job.document_id, source_uri=reference, media_type=job.media_type
         )
 
         claim = self.repository.claim(job.document_id)
@@ -109,7 +115,7 @@ class Worker:
             return self._already_handled(job, claim)
 
         try:
-            fetched = self.storage.fetch(job.reference)
+            fetched = self.storage.fetch(reference)
         except ServiceError as exc:
             return self._failed(job, None, exc)
 

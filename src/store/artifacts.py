@@ -149,9 +149,18 @@ class LocalArtifactStore(_BaseArtifactStore):
 class S3ArtifactStore(_BaseArtifactStore):
     """S3-backed. The client is injected so tests never reach AWS."""
 
-    def __init__(self, bucket: str, *, client: Any | None = None) -> None:
+    def __init__(
+        self, bucket: str, *, client: Any | None = None, prefix: str = ""
+    ) -> None:
         self.bucket = bucket
+        # An optional prefix so artifacts can share a bucket with raw uploads without
+        # colliding, and so a lifecycle rule can target them separately — parsed content
+        # is cheap to regenerate and can expire far more aggressively than a raw file.
+        self.prefix = f"{prefix.strip('/')}/" if prefix.strip("/") else ""
         self._client = client
+
+    def _full(self, key: str) -> str:
+        return f"{self.prefix}{key}"
 
     def _s3(self) -> Any:
         if self._client is None:
@@ -167,12 +176,12 @@ class S3ArtifactStore(_BaseArtifactStore):
     def _write(self, key: str, body: bytes) -> None:
         content_type = "application/json" if key.endswith(".json") else "image/png"
         self._s3().put_object(
-            Bucket=self.bucket, Key=key, Body=body, ContentType=content_type
+            Bucket=self.bucket, Key=self._full(key), Body=body, ContentType=content_type
         )
 
     def _read(self, key: str) -> bytes:
         try:
-            response = self._s3().get_object(Bucket=self.bucket, Key=key)
+            response = self._s3().get_object(Bucket=self.bucket, Key=self._full(key))
         except Exception as exc:
             code = str((getattr(exc, "response", {}) or {}).get("Error", {}).get("Code"))
             if code in ("NoSuchKey", "404"):
@@ -182,7 +191,7 @@ class S3ArtifactStore(_BaseArtifactStore):
 
     def exists(self, key: str) -> bool:
         try:
-            self._s3().head_object(Bucket=self.bucket, Key=key)
+            self._s3().head_object(Bucket=self.bucket, Key=self._full(key))
         except Exception:  # noqa: BLE001 - absent or unreachable; caller re-writes either way
             return False
         return True
@@ -192,7 +201,7 @@ class S3ArtifactStore(_BaseArtifactStore):
         removed = 0
         token: str | None = None
         while True:
-            kwargs: dict[str, Any] = {"Bucket": self.bucket, "Prefix": prefix}
+            kwargs: dict[str, Any] = {"Bucket": self.bucket, "Prefix": self._full(prefix)}
             if token:
                 kwargs["ContinuationToken"] = token
             listing = client.list_objects_v2(**kwargs)
