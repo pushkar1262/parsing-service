@@ -12,6 +12,7 @@ scan, persist, commit.
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from hashlib import sha256
 from typing import Any
 
@@ -39,6 +40,20 @@ def content_hash_of(data: bytes) -> str:
     return sha256(data).hexdigest()
 
 
+@dataclass
+class ParseOutput:
+    """The artifact, plus the page images that do not belong inside it.
+
+    Two return values rather than one, because a rendered page is megabytes of PNG and
+    the artifact is a JSON document that gets read on every content request. They travel
+    together out of the parser and separate immediately: the worker writes the images to
+    blob storage and records their keys on `Page.image_key`.
+    """
+
+    document: ParsedDocument
+    page_images: dict[int, bytes] = field(default_factory=dict)
+
+
 def parse_document(
     data: bytes,
     *,
@@ -48,6 +63,7 @@ def parse_document(
     content_hash: str | None = None,
     source: SourceRef | None = None,
     registry: Registry | None = None,
+    _collect_images: dict[int, bytes] | None = None,
 ) -> ParsedDocument:
     """Parse `data` into the canonical representation.
 
@@ -61,6 +77,9 @@ def parse_document(
 
     parser = registry.get(sniffed)
     result = parser.parse(data, filename=filename)
+
+    if _collect_images is not None:
+        _collect_images.update(result.page_images)
 
     if media_type and media_type != sniffed:
         result.warn(
@@ -79,6 +98,18 @@ def parse_document(
         content_hash=digest,
         source=source,
     )
+
+
+def parse_document_full(*args: Any, **kwargs: Any) -> ParseOutput:
+    """`parse_document`, keeping the page images as well.
+
+    The worker wants both; every other caller wants only the artifact, so the simple
+    signature stays the default rather than making everyone unpack a tuple.
+    """
+    collected: dict[int, bytes] = {}
+    kwargs["_collect_images"] = collected
+    document = parse_document(*args, **kwargs)
+    return ParseOutput(document=document, page_images=collected)
 
 
 def build_from_result(
