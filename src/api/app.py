@@ -69,10 +69,31 @@ def get_services(request: Request) -> Services:
     return request.app.state.services
 
 
+def get_tenant(request: Request) -> str | None:
+    """The tenant this request is scoped to, from a header the gateway sets.
+
+    Not from the URL and not from a body field: those are caller-controlled, and the whole
+    point is that a caller cannot choose whose documents it reads. The gateway
+    authenticates the end user and states the tenant; this service takes no user identity
+    and does no authentication of its own.
+
+    Absent is allowed and means unscoped, which is what makes single-tenant deployments and
+    the existing tests work. `REQUIRE_TENANT_HEADER=true` turns that off for a deployment
+    that is genuinely multi-tenant and would rather fail than serve broadly.
+    """
+    tenant = (request.headers.get("x-tenant-id") or "").strip()
+    if tenant:
+        return tenant
+    if getattr(request.app.state, "require_tenant", False):
+        raise HTTPException(400, "X-Tenant-Id is required")
+    return None
+
+
 # The Annotated form rather than `svc: Services = Depends(...)`: it is FastAPI's current
 # idiom, and it keeps a callable out of a default argument where it would be evaluated
 # once at import and shared.
 Svc = Annotated[Services, Depends(get_services)]
+Tenant = Annotated[str | None, Depends(get_tenant)]
 
 
 # --------------------------------------------------------------------------- #
@@ -82,6 +103,8 @@ Svc = Annotated[Services, Depends(get_services)]
 
 class StatusResponse(BaseModel):
     document_id: str
+    tenant_id: str | None = None
+    project_id: str | None = None
     status: DocumentStatus
     content_hash: str | None = None
     current_run_id: str | None = None
@@ -116,6 +139,8 @@ class ReprocessRequest(BaseModel):
 def _status(record: DocumentRecord) -> StatusResponse:
     return StatusResponse(
         document_id=record.id,
+        tenant_id=record.tenant_id,
+        project_id=record.project_id,
         status=record.status,
         content_hash=record.content_hash,
         current_run_id=record.current_run_id,
@@ -129,7 +154,9 @@ def _status(record: DocumentRecord) -> StatusResponse:
     )
 
 
-def create_app(services: Services | None = None) -> FastAPI:
+def create_app(
+    services: Services | None = None, *, require_tenant: bool = False
+) -> FastAPI:
     app = FastAPI(
         title="parsing-service",
         version="0.1.0",
@@ -137,16 +164,18 @@ def create_app(services: Services | None = None) -> FastAPI:
     )
     if services is not None:
         app.state.services = services
+    app.state.require_tenant = require_tenant
 
     # ----------------------------------------------------------------- status
 
     @app.get(f"{API_PREFIX}/documents/{{document_id}}", response_model=StatusResponse)
-    def status(document_id: str, svc: Svc):
-        return _status(_require(svc, document_id))
+    def status(document_id: str, svc: Svc, tenant: Tenant):
+        return _status(_require(svc, document_id, tenant))
 
     @app.get(f"{API_PREFIX}/documents", response_model=list[StatusResponse])
     def batch_status(
         svc: Svc,
+        tenant: Tenant,
         ids: str = Query(description="comma-separated document ids"),
     ):
         """One call for a document set, rather than N across a service boundary.
@@ -159,7 +188,7 @@ def create_app(services: Services | None = None) -> FastAPI:
             raise HTTPException(400, "no document ids given")
         if len(wanted) > 500:
             raise HTTPException(400, "at most 500 ids per request")
-        return [_status(r) for r in svc.repository.get_many(wanted)]
+        return [_status(r) for r in svc.repository.get_many(wanted, tenant_id=tenant)]
 
     # ---------------------------------------------------------------- content
 
@@ -169,12 +198,13 @@ def create_app(services: Services | None = None) -> FastAPI:
         response: Response,
         request: Request,
         svc: Svc,
+        tenant: Tenant,
         include: str = Query(
             default="text,blocks,pages",
             description="comma-separated: text, blocks, pages, tables",
         ),
     ):
-        record = _require(svc, document_id)
+        record = _require(svc, document_id, tenant)
         document = _load(svc, record)
         etag = _etag(record, svc)
 
@@ -198,21 +228,21 @@ def create_app(services: Services | None = None) -> FastAPI:
         return payload
 
     @app.get(f"{API_PREFIX}/documents/{{document_id}}/text", response_class=PlainTextResponse)
-    def text(document_id: str, response: Response, svc: Svc):
+    def text(document_id: str, response: Response, svc: Svc, tenant: Tenant):
         """The canonical text alone.
 
         Exists because it is what the consumer takes today: `ExtractRequest.document` in
         the planning service is a plain `str`. It should be able to adopt this API
         without restructuring, and move to `/content` when it wants sections and tables.
         """
-        record = _require(svc, document_id)
+        record = _require(svc, document_id, tenant)
         document = _load(svc, record)
         response.headers["ETag"] = _etag(record, svc)
         return document.text
 
     @app.post(f"{API_PREFIX}/documents/{{document_id}}/locate")
     def locate(
-        document_id: str, body: LocateRequest, svc: Svc
+        document_id: str, body: LocateRequest, svc: Svc, tenant: Tenant
     ):
         """Resolve quotes to spans, pages and blocks.
 
@@ -221,7 +251,7 @@ def create_app(services: Services | None = None) -> FastAPI:
         normalisation and its OCR provenance — all of which live here. Deciding what to do
         when a quote is missing stays there, where the model and the repair loop are.
         """
-        record = _require(svc, document_id)
+        record = _require(svc, document_id, tenant)
         document = _load(svc, record)
         locator = Locator(document)
         return {
@@ -258,6 +288,7 @@ def create_app(services: Services | None = None) -> FastAPI:
     def reprocess(
         document_id: str,
         svc: Svc,
+        tenant: Tenant,
         body: ReprocessRequest | None = None,
     ):
         """Re-run parsing on the existing raw file, without a re-upload.
@@ -266,7 +297,7 @@ def create_app(services: Services | None = None) -> FastAPI:
         The document's status is deliberately untouched: it keeps serving the previous
         artifact until the new run succeeds.
         """
-        record = _require(svc, document_id)
+        record = _require(svc, document_id, tenant)
         if record.source_uri is None:
             raise HTTPException(409, "this document has no recorded source reference")
         if svc.publisher is None:
@@ -276,6 +307,9 @@ def create_app(services: Services | None = None) -> FastAPI:
         job = Job(
             document_id=document_id,
             reference=record.source_uri,
+            # From the row, never from the request: a caller cannot relabel a document.
+            tenant_id=record.tenant_id,
+            project_id=record.project_id,
             media_type=record.media_type,
             parse_options=body.parse_options,
             force=body.force,
@@ -286,14 +320,14 @@ def create_app(services: Services | None = None) -> FastAPI:
         return {"document_id": document_id, "accepted": True, "status": record.status}
 
     @app.delete(f"{API_PREFIX}/documents/{{document_id}}", status_code=202)
-    def delete(document_id: str, svc: Svc):
+    def delete(document_id: str, svc: Svc, tenant: Tenant):
         """Tombstone now, clean up asynchronously.
 
         Returns 202 rather than 204 because the derived data (artifact, page images,
         future embeddings) is removed by a cleanup worker. The document stops being
         readable immediately, which is the part the caller asked for.
         """
-        record = svc.repository.get(document_id)
+        record = svc.repository.get(document_id, tenant_id=tenant)
         if record is None:
             raise HTTPException(404, f"no document {document_id}")
         svc.repository.mark_deleted(document_id)
@@ -322,8 +356,10 @@ def create_app(services: Services | None = None) -> FastAPI:
 # --------------------------------------------------------------------------- #
 
 
-def _require(svc: Services, document_id: str) -> DocumentRecord:
-    record = svc.repository.get(document_id)
+def _require(
+    svc: Services, document_id: str, tenant_id: str | None = None
+) -> DocumentRecord:
+    record = svc.repository.get(document_id, tenant_id=tenant_id)
     if record is None:
         raise HTTPException(404, f"no document {document_id}")
     if record.status is DocumentStatus.DELETED or record.deleted_at is not None:

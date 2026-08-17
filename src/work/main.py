@@ -22,9 +22,10 @@ import logging
 import signal
 import sys
 import time
+from pathlib import Path
 from typing import Any
 
-from config import ConfigError, Settings
+from config import ConfigError, Settings, _host_of, _role_of
 from domain.errors import ServiceError
 from store.repository import InMemoryRepository
 from work.queue import Job
@@ -91,8 +92,40 @@ def build_repository(settings: Settings):
 
     from store.postgres import PostgresRepository
 
-    repository = PostgresRepository(psycopg.connect(settings.database_url))
-    repository.migrate()
+    # Migrate with the privileged role, then serve with the app role. Two connections
+    # rather than one because eos_app has no CREATE — and because a service holding DDL
+    # privileges it needs once at deploy time is a standing risk for no benefit.
+    def connect(url: str, what: str):
+        """Turn a connection failure into a sentence, not a traceback.
+
+        A worker that cannot reach its database has a configuration problem, and the useful
+        output is which role and which host — not eight frames of psycopg internals with
+        the password redacted out of the middle of them.
+        """
+        try:
+            return psycopg.connect(url)
+        except psycopg.OperationalError as exc:
+            raise ConfigError(
+                f"cannot connect to the {what} database as "
+                f"{_role_of(url) or 'an unnamed role'} at {_host_of(url)}: "
+                f"{str(exc).strip().splitlines()[-1]}"
+            ) from exc
+
+    if settings.database_migrate_url:
+        migrator = PostgresRepository(connect(settings.database_migrate_url, "migration"))
+        try:
+            migrator.migrate()
+        finally:
+            migrator._connection.close()
+    repository = PostgresRepository(connect(settings.database_url, "application"))
+    if not settings.database_migrate_url:
+        # No separate URL: migrate as whoever DATABASE_URL is. Works, and warns, because
+        # a role that can run these migrations is usually also a role RLS does not apply to.
+        log.warning(
+            "no DATABASE_MIGRATE_URL set; running migrations as the application role. "
+            "If that role owns the tables, row-level security is not being enforced."
+        )
+        repository.migrate()
     return repository
 
 
@@ -170,10 +203,10 @@ def check(settings: Settings) -> int:
     return 0 if ok else 1
 
 
-def run_one(settings: Settings, document_id: str, reference: str) -> int:
+def run_one(settings: Settings, job: Job) -> int:
     """Process a single document without a broker. The fastest way to test S3 wiring."""
     worker = build_worker(settings)
-    outcome = worker.process(Job(document_id=document_id, reference=reference))
+    outcome = worker.process(job)
     print(
         json.dumps(
             {
@@ -202,10 +235,12 @@ def consume(settings: Settings, *, once: bool = False) -> int:
             "Use --document/--reference to process one document directly."
         )
     from work.kafka import KafkaConfig, KafkaWorkerLoop
+    from work.queue import RETRY_TIERS
 
     config = KafkaConfig(
         bootstrap_servers=settings.kafka_bootstrap_servers,
         group_id=settings.kafka_group_id,
+        topics=(settings.kafka_topic_requested, *(t for t, _ in RETRY_TIERS)),
     )
     loop = KafkaWorkerLoop(config, build_worker(settings))
 
@@ -229,12 +264,31 @@ def consume(settings: Settings, *, once: bool = False) -> int:
     return 0
 
 
+def _job_from_event_arg(value: str) -> Job:
+    """Read an upload event from a file or straight from the argument.
+
+    A path first, because a real payload has quotes in it and shell-escaping JSON is how
+    people end up debugging their own escaping rather than the service.
+    """
+    candidate = Path(value)
+    raw = candidate.read_bytes() if candidate.is_file() else value.encode("utf-8")
+    return Job.from_bytes(raw)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--check", action="store_true", help="validate config, then exit")
     parser.add_argument("--once", action="store_true", help="handle one message, then exit")
     parser.add_argument("--document", help="process this document id without a queue")
     parser.add_argument("--reference", help="S3 key, s3:// URI or presigned URL")
+    parser.add_argument("--tenant", help="tenant id to scope the run to")
+    parser.add_argument("--project", help="project id to record")
+    parser.add_argument(
+        "--event",
+        metavar="JSON|PATH",
+        help="an upload event, inline or as a file — the exact payload the backend "
+        "publishes, so the mapping can be tested without a broker",
+    )
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args(argv)
 
@@ -244,10 +298,20 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.check:
             return check(settings)
+        if args.event:
+            return run_one(settings, _job_from_event_arg(args.event))
         if args.document:
             if not args.reference:
                 parser.error("--document also needs --reference")
-            return run_one(settings, args.document, args.reference)
+            return run_one(
+                settings,
+                Job(
+                    document_id=args.document,
+                    reference=args.reference,
+                    tenant_id=args.tenant,
+                    project_id=args.project,
+                ),
+            )
         return consume(settings, once=args.once)
     except ConfigError as exc:
         log.error("configuration error", extra={"detail": str(exc)})

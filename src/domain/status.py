@@ -128,6 +128,11 @@ class DocumentRecord:
     """The row consumers read, and the one the status API serves."""
 
     id: str
+    # Tenancy is on the row, not derived from the key. Every read is scoped by it, and on
+    # Postgres the row-level security policy matches against it — which is why it must be
+    # populated at registration rather than backfilled.
+    tenant_id: str | None = None
+    project_id: str | None = None
     status: DocumentStatus = DocumentStatus.PENDING
     content_hash: str | None = None
     source_uri: str | None = None

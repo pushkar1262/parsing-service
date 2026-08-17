@@ -42,7 +42,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
-from work.queue import RETRY_TIERS, TOPIC_REQUESTED, Job, Message
+from work.queue import RETRY_TIERS, TOPIC_DLQ, TOPIC_REQUESTED, Job, MalformedEvent, Message
 from work.worker import Disposition, Outcome, Worker
 
 log = logging.getLogger(__name__)
@@ -161,7 +161,21 @@ class KafkaWorkerLoop:
             if not self._due(message, consumer):
                 continue
 
-            job = Job.from_bytes(message.value())
+            try:
+                job = Job.from_bytes(message.value())
+            except (MalformedEvent, ValueError, TypeError) as exc:
+                # Permanent by nature: republishing an event with no s3_key produces the
+                # same event. Dead-letter with the reason and commit, rather than blocking
+                # the partition on a message that can never succeed.
+                log.error(
+                    "malformed event",
+                    extra={"detail": str(exc), "topic": message.topic()},
+                )
+                self._dead_letter(message, str(exc))
+                consumer.commit(message=message, asynchronous=False)
+                handled += 1
+                continue
+
             outcome = self.handle(job)
             # Commit last. Everything in the worker's design assumes this ordering.
             consumer.commit(message=message, asynchronous=False)
@@ -210,6 +224,29 @@ class KafkaWorkerLoop:
         consumer.pause([partition])
         log.debug("paused %s until %s", message.topic(), when.isoformat())
         return False
+
+    def _dead_letter(self, message: Any, reason: str) -> None:
+        """Route a message we cannot even parse, preserving the original bytes.
+
+        The payload is kept verbatim rather than re-serialised: whatever is wrong with it is
+        exactly what somebody will need to look at.
+        """
+        publisher = getattr(self._worker, "publisher", None)
+        if publisher is None:
+            return
+        key = message.key()
+        publisher.publish(
+            Message(
+                topic=TOPIC_DLQ,
+                key=(key.decode("utf-8", "replace") if key else "unknown"),
+                value=message.value(),
+                headers={
+                    "failure_class": "malformed_event",
+                    "failure_reason": reason,
+                    "source_topic": message.topic(),
+                },
+            )
+        )
 
     def stop(self) -> None:
         self._running = False

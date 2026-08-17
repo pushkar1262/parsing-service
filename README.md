@@ -56,11 +56,11 @@ broker and no `tesseract` binary, so those three adapters are written but have n
 executed. What *is* verified is the logic they drive: `InMemoryRepository` is a real
 implementation (its claim is a conditional update, its `start_run` raises on the unique
 key), the worker's ordering and retry routing run against it, and every OCR test runs
-against a fake backend. Run `tests/test_postgres.py` against a live database before trusting the SQL in
-production; `docker-compose.yml` brings up Postgres and Redpanda (Kafka-protocol
-compatible, so the adapter is unchanged) for exactly that. Blob storage is real S3 — no
-local stand-in — so anything touching an `s3://` reference needs AWS credentials in the
-environment.
+against a fake backend. Postgres, Kafka and S3 all run outside this repo — there is no compose file. Point
+`.env` at them (`.env.example` documents every variable) and run
+`python -m work.main --check`, which resolves the config and reaches each dependency
+before consuming anything. Run `tests/test_postgres.py` against the live database before
+trusting the SQL.
 
 ## The one idea worth knowing
 
@@ -122,6 +122,60 @@ Three things a local `quote in text` cannot give you:
 - **`occurrences`** → a quote matching six times (a repeated footer) makes page
   attribution a coin flip, and the caller should know rather than receive the first
   hit as though it were the only one.
+
+## The upload event
+
+The backend publishes one message per uploaded file:
+
+```json
+{
+  "event_id":     "e1d2feeb-…",
+  "document_id":  "c98f59f8-…",
+  "tenant_id":    "11111111-…",
+  "project_id":   "0c9d0601-…",
+  "s3_bucket":    "eos-s3",
+  "s3_key":       "uploads/{tenant}/{project}/{document}.txt",
+  "filename":     "sample.txt",
+  "content_type": "text/plain",
+  "size":         77
+}
+```
+
+`Job.from_bytes` reads this **and** this service's own retry/DLQ serialisation, dispatching
+on whether `reference` is present — one consumer group reads both topics, and a replayed
+DLQ message then works wherever it is published. `document_id` is the partition key, so
+every job for one document lands on one partition and concurrent processing of it is
+structurally impossible.
+
+Four fields are required (`document_id`, `s3_bucket`, `s3_key`, `tenant_id`) and a message
+missing any of them is dead-lettered by name rather than retried — republishing an event
+with no `s3_key` produces the same event. Unknown fields are ignored, so the producer can
+add one without a coordinated deploy.
+
+Try it without a broker:
+
+```bash
+PYTHONPATH=src python -m work.main --event event.json
+```
+
+## Tenancy
+
+`tenant_id` scopes every read and write. Two layers, deliberately:
+
+- **Postgres RLS** ([`002_tenancy.sql`](src/store/migrations/002_tenancy.sql)) is the real
+  enforcement. The service connects as `eos_app` and sets `app.tenant_id` per transaction
+  with `SET LOCAL` — `LOCAL`, because connections are pooled and a `SESSION` setting would
+  leak the previous request's tenant into the next one. Policies carry `WITH CHECK` as well
+  as `USING`, or a session scoped to tenant A could *insert* a row labelled tenant B.
+- **The API and repository scope explicitly too.** RLS does not apply to the table owner,
+  so pointing `DATABASE_URL` at `postgres` silently disables every policy — the redundant
+  `WHERE tenant_id = …` is what still holds if that happens, and it is what
+  [`tests/test_tenancy.py`](tests/test_tenancy.py) can actually exercise.
+
+Reads are scoped by an `X-Tenant-Id` header the gateway sets — not a URL or body field,
+which the caller controls. A cross-tenant read is **404, not 403**: confirming a document
+exists is itself a disclosure. `REQUIRE_TENANT_HEADER=true` rejects an unscoped read
+outright.
 
 ## Fetching the raw file
 

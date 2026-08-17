@@ -54,7 +54,9 @@ def build_app():
     configure_logging()
     settings = Settings.from_env()
     log.info("api starting", extra=settings.describe())
-    return create_app(build_services(settings))
+    return create_app(
+        build_services(settings), require_tenant=settings.require_tenant_header
+    )
 
 
 app = build_app()

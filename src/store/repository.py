@@ -78,11 +78,17 @@ class DocumentRepository(Protocol):
         *,
         source_uri: str | None = None,
         media_type: str | None = None,
+        tenant_id: str | None = None,
+        project_id: str | None = None,
     ) -> DocumentRecord: ...
 
-    def get(self, document_id: str) -> DocumentRecord | None: ...
+    def get(
+        self, document_id: str, *, tenant_id: str | None = None
+    ) -> DocumentRecord | None: ...
 
-    def get_many(self, document_ids: list[str]) -> list[DocumentRecord]: ...
+    def get_many(
+        self, document_ids: list[str], *, tenant_id: str | None = None
+    ) -> list[DocumentRecord]: ...
 
     def claim(self, document_id: str, *, lease_seconds: int = 1800) -> ClaimResult: ...
 
@@ -139,6 +145,8 @@ class InMemoryRepository:
         *,
         source_uri: str | None = None,
         media_type: str | None = None,
+        tenant_id: str | None = None,
+        project_id: str | None = None,
     ) -> DocumentRecord:
         """Create the row if absent, leave it alone if present.
 
@@ -153,6 +161,8 @@ class InMemoryRepository:
         now = self._clock()
         record = DocumentRecord(
             id=document_id,
+            tenant_id=tenant_id,
+            project_id=project_id,
             status=DocumentStatus.PENDING,
             source_uri=source_uri,
             media_type=media_type,
@@ -162,11 +172,29 @@ class InMemoryRepository:
         self._documents[document_id] = record
         return record
 
-    def get(self, document_id: str) -> DocumentRecord | None:
-        return self._documents.get(document_id)
+    def get(
+        self, document_id: str, *, tenant_id: str | None = None
+    ) -> DocumentRecord | None:
+        """Scoped when a tenant is given, unscoped when it is not.
 
-    def get_many(self, document_ids: list[str]) -> list[DocumentRecord]:
-        return [self._documents[i] for i in document_ids if i in self._documents]
+        The scoping is enforced here as well as by Postgres RLS, deliberately. The API
+        runs against this implementation in tests, so a cross-tenant read is caught by a
+        test rather than only by a policy nobody can exercise without a database.
+        """
+        record = self._documents.get(document_id)
+        if record is None:
+            return None
+        if tenant_id is not None and record.tenant_id != tenant_id:
+            # Absent rather than forbidden: telling a caller a document exists but belongs
+            # to someone else is itself a disclosure.
+            return None
+        return record
+
+    def get_many(
+        self, document_ids: list[str], *, tenant_id: str | None = None
+    ) -> list[DocumentRecord]:
+        found = (self.get(i, tenant_id=tenant_id) for i in document_ids)
+        return [record for record in found if record is not None]
 
     def claim(self, document_id: str, *, lease_seconds: int = 1800) -> ClaimResult:
         """The idempotency gate: move to `processing` only from a claimable status.

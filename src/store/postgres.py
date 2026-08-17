@@ -42,7 +42,7 @@ from store.repository import ClaimResult, Clock, DuplicateRun, utc_now
 MIGRATIONS = Path(__file__).parent / "migrations"
 
 _DOCUMENT_COLUMNS = """
-    id, status, content_hash, source_uri, source_bucket, source_key,
+    id, tenant_id, project_id, status, content_hash, source_uri, source_bucket, source_key,
     source_version_id, media_type, byte_size, current_run_id, metadata,
     failure_class, failure_reason, created_at, updated_at, deleted_at
 """
@@ -57,26 +57,28 @@ _RUN_COLUMNS = """
 def _document(row: Any) -> DocumentRecord | None:
     if row is None:
         return None
-    metadata = row[10]
+    metadata = row[12]
     if isinstance(metadata, str):
         metadata = json.loads(metadata)
     return DocumentRecord(
         id=row[0],
-        status=DocumentStatus(row[1]),
-        content_hash=row[2],
-        source_uri=row[3],
-        source_bucket=row[4],
-        source_key=row[5],
-        source_version_id=row[6],
-        media_type=row[7],
-        byte_size=row[8],
-        current_run_id=str(row[9]) if row[9] else None,
+        tenant_id=str(row[1]) if row[1] else None,
+        project_id=str(row[2]) if row[2] else None,
+        status=DocumentStatus(row[3]),
+        content_hash=row[4],
+        source_uri=row[5],
+        source_bucket=row[6],
+        source_key=row[7],
+        source_version_id=row[8],
+        media_type=row[9],
+        byte_size=row[10],
+        current_run_id=str(row[11]) if row[11] else None,
         metadata=metadata or {},
-        failure_class=row[11],
-        failure_reason=row[12],
-        created_at=row[13],
-        updated_at=row[14],
-        deleted_at=row[15],
+        failure_class=row[13],
+        failure_reason=row[14],
+        created_at=row[15],
+        updated_at=row[16],
+        deleted_at=row[17],
     )
 
 
@@ -105,11 +107,39 @@ class PostgresRepository:
     def __init__(self, connection: Any, *, clock: Clock = utc_now) -> None:
         self._connection = connection
         self._clock = clock
+        self._tenant: str | None = None
+
+    # ------------------------------------------------------------ RLS context
+
+    def use_tenant(self, tenant_id: str | None) -> None:
+        """Set the tenant every subsequent statement is scoped to.
+
+        Called once per job or request. The value reaches Postgres as
+        `SET LOCAL app.tenant_id`, which the policies in `002_tenancy.sql` match against.
+        """
+        self._tenant = tenant_id
+
+    def _scope(self, cursor: Any) -> None:
+        """Apply the tenant to this transaction.
+
+        LOCAL rather than SESSION: connections are pooled, and a SESSION setting outlives
+        the request that made it — the next request on that connection would silently
+        inherit the previous tenant, which is the worst possible version of this bug
+        because it only appears under concurrency.
+
+        set_config with a bound parameter rather than string interpolation, because SET
+        does not accept placeholders and building the statement by hand is a SQL injection
+        in the one place that would defeat the isolation it is enforcing.
+        """
+        if self._tenant is None:
+            return
+        cursor.execute("SELECT set_config('app.tenant_id', %s, true)", (self._tenant,))
 
     # ---------------------------------------------------------------- schema
 
     def migrate(self) -> None:
         with self._connection.cursor() as cursor:
+            self._scope(cursor)
             for path in sorted(MIGRATIONS.glob("*.sql")):
                 cursor.execute(path.read_text())
         self._connection.commit()
@@ -122,6 +152,8 @@ class PostgresRepository:
         *,
         source_uri: str | None = None,
         media_type: str | None = None,
+        tenant_id: str | None = None,
+        project_id: str | None = None,
     ) -> DocumentRecord:
         """Insert if absent, and *never* reset an existing row.
 
@@ -130,41 +162,68 @@ class PostgresRepository:
         pending every time its job was replayed.
         """
         with self._connection.cursor() as cursor:
+            self._scope(cursor)
             cursor.execute(
                 f"""
-                INSERT INTO documents (id, status, source_uri, media_type)
-                VALUES (%s, 'pending', %s, %s)
+                INSERT INTO documents
+                       (id, tenant_id, project_id, status, source_uri, media_type)
+                VALUES (%s, %s, %s, 'pending', %s, %s)
                 ON CONFLICT (id) DO UPDATE
                    SET source_uri = COALESCE(documents.source_uri, EXCLUDED.source_uri),
-                       media_type = COALESCE(documents.media_type, EXCLUDED.media_type)
+                       media_type = COALESCE(documents.media_type, EXCLUDED.media_type),
+                       project_id = COALESCE(documents.project_id, EXCLUDED.project_id)
                 RETURNING {_DOCUMENT_COLUMNS}
                 """,
-                (document_id, source_uri, media_type),
+                (
+                    document_id,
+                    tenant_id or self._tenant,
+                    project_id,
+                    source_uri,
+                    media_type,
+                ),
             )
             record = _document(cursor.fetchone())
         self._connection.commit()
         return record
 
-    def get(self, document_id: str) -> DocumentRecord | None:
+    def get(
+        self, document_id: str, *, tenant_id: str | None = None
+    ) -> DocumentRecord | None:
+        """RLS already scopes this; the explicit predicate is belt and braces.
+
+        Deliberate redundancy: if DATABASE_URL is ever pointed at the table owner, every
+        policy silently stops applying, and this WHERE clause is the only thing still
+        preventing a cross-tenant read.
+        """
+        scope = tenant_id or self._tenant
         with self._connection.cursor() as cursor:
+            self._scope(cursor)
             cursor.execute(
-                f"SELECT {_DOCUMENT_COLUMNS} FROM documents WHERE id = %s", (document_id,)
+                f"""SELECT {_DOCUMENT_COLUMNS} FROM documents
+                     WHERE id = %s AND (%s::uuid IS NULL OR tenant_id = %s::uuid)""",
+                (document_id, scope, scope),
             )
             return _document(cursor.fetchone())
 
-    def get_many(self, document_ids: list[str]) -> list[DocumentRecord]:
+    def get_many(
+        self, document_ids: list[str], *, tenant_id: str | None = None
+    ) -> list[DocumentRecord]:
         if not document_ids:
             return []
+        scope = tenant_id or self._tenant
         with self._connection.cursor() as cursor:
+            self._scope(cursor)
             cursor.execute(
-                f"SELECT {_DOCUMENT_COLUMNS} FROM documents WHERE id = ANY(%s)",
-                (list(document_ids),),
+                f"""SELECT {_DOCUMENT_COLUMNS} FROM documents
+                     WHERE id = ANY(%s) AND (%s::uuid IS NULL OR tenant_id = %s::uuid)""",
+                (list(document_ids), scope, scope),
             )
             return [_document(row) for row in cursor.fetchall()]
 
     def claim(self, document_id: str, *, lease_seconds: int = 1800) -> ClaimResult:
         """One conditional UPDATE. The row count *is* the answer."""
         with self._connection.cursor() as cursor:
+            self._scope(cursor)
             cursor.execute(
                 f"""
                 UPDATE documents
@@ -194,6 +253,7 @@ class PostgresRepository:
 
     def mark_deleted(self, document_id: str) -> DocumentRecord | None:
         with self._connection.cursor() as cursor:
+            self._scope(cursor)
             cursor.execute(
                 f"""
                 UPDATE documents
@@ -217,6 +277,7 @@ class PostgresRepository:
         parse_options_hash: str = "",
     ) -> ParseRun | None:
         with self._connection.cursor() as cursor:
+            self._scope(cursor)
             cursor.execute(
                 f"""
                 SELECT {_RUN_COLUMNS} FROM parse_runs
@@ -237,18 +298,27 @@ class PostgresRepository:
         expires = self._clock() + timedelta(seconds=1800)
         try:
             with self._connection.cursor() as cursor:
+                self._scope(cursor)
                 cursor.execute(
                     f"""
                     INSERT INTO parse_runs (
-                        id, document_id, content_hash, parser_version,
+                        id, tenant_id, document_id, content_hash, parser_version,
                         parse_options_hash, status, attempt, lease_expires_at,
                         trace_id, started_at
                     )
-                    VALUES (%s, %s, %s, %s, %s, 'running', %s, %s, %s, now())
+                    VALUES (
+                        %s,
+                        -- Copied from the document rather than taken from the caller, so a
+                        -- run can never be labelled with a different tenant than the
+                        -- document it belongs to.
+                        (SELECT tenant_id FROM documents WHERE id = %s),
+                        %s, %s, %s, %s, 'running', %s, %s, %s, now()
+                    )
                     RETURNING {_RUN_COLUMNS}
                     """,
                     (
                         run_id,
+                        run.document_id,
                         run.document_id,
                         run.content_hash,
                         run.parser_version,
@@ -276,11 +346,13 @@ class PostgresRepository:
 
     def get_run(self, run_id: str) -> ParseRun | None:
         with self._connection.cursor() as cursor:
+            self._scope(cursor)
             cursor.execute(f"SELECT {_RUN_COLUMNS} FROM parse_runs WHERE id = %s", (run_id,))
             return _run(cursor.fetchone())
 
     def runs_for(self, document_id: str) -> list[ParseRun]:
         with self._connection.cursor() as cursor:
+            self._scope(cursor)
             cursor.execute(
                 f"""
                 SELECT {_RUN_COLUMNS} FROM parse_runs
@@ -305,6 +377,7 @@ class PostgresRepository:
         500 rather than a 409 — an error that looks like our bug because it is.
         """
         with self._connection.cursor() as cursor:
+            self._scope(cursor)
             cursor.execute(
                 """
                 UPDATE parse_runs
@@ -359,6 +432,7 @@ class PostgresRepository:
         later run failing.
         """
         with self._connection.cursor() as cursor:
+            self._scope(cursor)
             cursor.execute(
                 """
                 UPDATE parse_runs
@@ -403,6 +477,7 @@ class PostgresRepository:
         both reclaim the same document and re-publish it twice.
         """
         with self._connection.cursor() as cursor:
+            self._scope(cursor)
             cursor.execute(
                 """
                 WITH expired AS (

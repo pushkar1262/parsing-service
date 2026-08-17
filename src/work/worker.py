@@ -106,8 +106,20 @@ class Worker:
 
     def process(self, job: Job) -> Outcome:
         reference = self._resolve(job.reference)
+        # Scope the connection before the first statement. On Postgres this sets
+        # `app.tenant_id`, which the row-level security policies match against; on the
+        # in-memory repository it does nothing, which is why the explicit tenant_id below
+        # is passed as well.
+        scope = getattr(self.repository, "use_tenant", None)
+        if scope is not None:
+            scope(job.tenant_id)
+
         self.repository.register(
-            job.document_id, source_uri=reference, media_type=job.media_type
+            job.document_id,
+            source_uri=reference,
+            media_type=job.media_type,
+            tenant_id=job.tenant_id,
+            project_id=job.project_id,
         )
 
         claim = self.repository.claim(job.document_id)
@@ -165,7 +177,9 @@ class Worker:
                 document_id=job.document_id,
                 content_hash=fetched.content_hash,
                 media_type=fetched.declared_media_type,
-                filename=_filename_of(job, fetched),
+                # The uploaded filename, not the S3 key: the key is a UUID, and Markdown
+                # and plain text are byte-identical, so the extension is the only signal.
+                filename=job.filename or _filename_of(job, fetched),
                 source=fetched.source,
                 registry=self.registry,
             )
@@ -365,8 +379,11 @@ class Worker:
             event,
             {
                 "document_id": job.document_id,
+                "tenant_id": job.tenant_id,
+                "project_id": job.project_id,
                 "attempt": job.attempt,
                 "trace_id": job.trace_id,
+                "event_id": job.event_id,
                 **fields,
             },
         )
