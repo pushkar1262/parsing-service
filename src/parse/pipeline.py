@@ -21,6 +21,7 @@ from domain.document import (
     ParsedDocument,
     SourceRef,
 )
+from parse.base import ParseResult
 from parse.detect import detect
 from parse.registry import Registry, default_registry
 from parse.serialize import serialize
@@ -68,15 +69,44 @@ def parse_document(
             f"parsed as {sniffed!r}",
         )
 
-    serialised = serialize(
-        result.blocks, content_hash=digest, page_meta=result.page_meta
+    return build_from_result(
+        result,
+        data=data,
+        document_id=document_id,
+        fallback_format=sniffed,
+        parser_name=parser.name,
+        parser_version=parser.version,
+        content_hash=digest,
+        source=source,
     )
+
+
+def build_from_result(
+    result: ParseResult,
+    *,
+    data: bytes,
+    document_id: str,
+    fallback_format: str,
+    parser_name: str = "unknown",
+    parser_version: str = "0",
+    content_hash: str | None = None,
+    source: SourceRef | None = None,
+) -> ParsedDocument:
+    """Serialise a parser's output into the artifact.
+
+    Split out from `parse_document` so a caller holding a `ParseResult` — a test
+    exercising one parser directly, or a worker that resolved the parser itself in order
+    to configure it — can reach the same artifact without going back through detection
+    and registry lookup.
+    """
+    digest = content_hash or content_hash_of(data)
+    serialised = serialize(result.blocks, content_hash=digest, page_meta=result.page_meta)
 
     metadata = _metadata(
         result.metadata,
-        parser_name=parser.name,
-        parser_version=parser.version,
-        fallback_format=sniffed,
+        parser_name=parser_name,
+        parser_version=parser_version,
+        fallback_format=fallback_format,
         text=serialised.text,
         blocks=serialised.blocks,
         page_count=len(serialised.pages) or None,

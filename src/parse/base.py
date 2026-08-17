@@ -74,6 +74,10 @@ class ParseResult:
     metadata: dict[str, Any] = field(default_factory=dict)
     page_meta: dict[int, PageInfo] = field(default_factory=dict)
     warnings: list[ParseWarning] = field(default_factory=list)
+    # Rendered page images, by page number. Not part of the artifact — the worker writes
+    # them to blob storage and records the key on `Page.image_key`, because a
+    # multi-megabyte PNG has no business inside a JSON document.
+    page_images: dict[int, bytes] = field(default_factory=dict)
 
     def warn(self, code: str, message: str, *, page: int | None = None) -> None:
         self.warnings.append(ParseWarning(code=code, message=message, page=page))

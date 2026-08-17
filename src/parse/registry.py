@@ -50,7 +50,7 @@ class Registry:
         return sorted(self._by_media_type)
 
 
-def default_registry() -> Registry:
+def default_registry(*, ocr: object | None = None) -> Registry:
     """Every parser whose dependencies are actually importable.
 
     The try/except around each optional parser is the whole point: importing this
@@ -60,6 +60,11 @@ def default_registry() -> Registry:
     registry.register(TextParser())
     registry.register(HtmlParser())
     registry.register(CsvParser())
+
+    # Parsers that can use OCR are given the backend rather than constructing one, so a
+    # deployment picks its engine once and every format follows.
+    _try(registry, "parse.image", "ImageParser", IMAGE_MEDIA_TYPES, "Pillow", "ocr",
+         kwargs={"ocr": ocr} if ocr else {})
 
     _try(
         registry,
@@ -76,6 +81,7 @@ def default_registry() -> Registry:
         ("application/pdf",),
         "pypdfium2",
         "pdf",
+        kwargs={"ocr": ocr} if ocr else {},
     )
     _try(
         registry,
@@ -88,6 +94,16 @@ def default_registry() -> Registry:
     return registry
 
 
+IMAGE_MEDIA_TYPES = (
+    "image/png",
+    "image/jpeg",
+    "image/tiff",
+    "image/bmp",
+    "image/gif",
+    "image/webp",
+)
+
+
 def _try(
     registry: Registry,
     module: str,
@@ -95,6 +111,7 @@ def _try(
     media_types: tuple[str, ...],
     package: str,
     extra: str,
+    kwargs: dict | None = None,
 ) -> None:
     """Register a parser, or record why it is unavailable.
 
@@ -105,7 +122,7 @@ def _try(
     """
     try:
         imported = __import__(module, fromlist=[attribute])
-        parser = getattr(imported, attribute)()
+        parser = getattr(imported, attribute)(**(kwargs or {}))
     except ImportError as exc:  # pragma: no cover - depends on the environment
         for media_type in media_types:
             registry.mark_unavailable(

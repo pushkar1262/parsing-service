@@ -52,8 +52,10 @@ import pypdfium2 as pdfium
 import pypdfium2.raw as pdfium_raw
 
 from domain.document import BlockType, PageSource, TableData
+from domain.errors import OcrUnavailable
 from parse.base import CorruptDocument, EncryptedDocument, PageInfo, ParseResult, RawBlock
 from parse.normalise import clean_inline, join_wrapped, normalise
+from parse.ocr.base import NullOcr, OcrBackend
 
 # A page yielding fewer than this many characters is a scan, a cover page, or a broken
 # font map. All three deserve a closer look, and only a human or OCR can tell them apart.
@@ -114,6 +116,9 @@ class _Line:
     top: float
     bottom: float
     page: int
+    # Set only for OCR'd lines. It travels through to Block.confidence so a downstream
+    # quote check can be lenient exactly where the text is uncertain, and nowhere else.
+    confidence: float | None = None
 
 
 @dataclass
@@ -149,6 +154,8 @@ class _Extraction:
     elements: list[_Element] = field(default_factory=list)
     page_meta: dict[int, PageInfo] = field(default_factory=dict)
     ocr_candidates: list[int] = field(default_factory=list)
+    # Pages that were actually read by OCR, as opposed to merely flagged as needing it.
+    ocr_pages: list[int] = field(default_factory=list)
     page_count: int = 0
 
     @property
@@ -161,12 +168,30 @@ class PdfParser:
     version = "1.0"
     media_types = ("application/pdf",)
 
-    def __init__(self, *, extract_tables: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        extract_tables: bool = True,
+        ocr: OcrBackend | None = None,
+        ocr_dpi: int = 200,
+        render_page_images: bool = True,
+    ) -> None:
         # Table extraction is a second pass over the file with a different library and it
         # is the slow part of parsing a large PDF. On by default because a requirements
         # table read as loose lines is a silent loss of exactly the content that matters
         # most; off for a deployment that has measured the cost and decided against it.
         self.extract_tables = extract_tables
+        # Injected rather than constructed, because OCR needs a native binary that is not
+        # present everywhere. A service whose page-attribution logic could only be tested
+        # where tesseract happens to be installed is one that does not test it.
+        self.ocr = ocr or NullOcr()
+        # 200 dpi is the usual floor for reliable OCR of body text: below it accuracy
+        # falls off sharply, far above it render cost grows for very little gain.
+        self.ocr_dpi = ocr_dpi
+        # The vision fallback the planning service declares it needs
+        # (`requires: [json_schema, vision]`). Rendered only for OCR'd pages, since those
+        # are the ones whose text a model may need to check against the original.
+        self.render_page_images = render_page_images
 
     def parse(self, data: bytes, *, filename: str | None = None) -> ParseResult:
         result = ParseResult()
@@ -193,8 +218,8 @@ class PdfParser:
                 "format": "pdf",
                 "page_count": extraction.page_count,
                 "has_text_layer": bool(extraction.lines),
-                "ocr_applied": False,
-                "ocr_page_count": 0,
+                "ocr_applied": bool(extraction.ocr_pages),
+                "ocr_page_count": len(extraction.ocr_pages),
             }
         )
         if "title" not in metadata:
@@ -257,6 +282,25 @@ class PdfParser:
             # *plus something drawn* — so the image check is what makes the signal usable.
             if characters < MIN_CHARS_PER_PAGE and has_images:
                 extraction.ocr_candidates.append(number)
+                recognised = self._ocr_page(document, index, number, result)
+                if recognised is not None:
+                    # OCR *replaces* the page's lines rather than adding to them:
+                    # whatever the unusable text layer produced is exactly the garbage
+                    # OCR was run to avoid, and keeping both interleaves the two.
+                    scores = [
+                        line.confidence
+                        for line in recognised
+                        if line.confidence is not None
+                    ]
+                    extraction.page_meta[number] = PageInfo(
+                        source=PageSource.OCR,
+                        confidence=(sum(scores) / len(scores)) if scores else None,
+                    )
+                    extraction.ocr_pages.append(number)
+                    extraction.elements.extend(
+                        self._merge(recognised, tables.get(number, []))
+                    )
+                    continue
                 result.warn(
                     "page_needs_ocr",
                     f"page {number} yielded {characters} characters but contains "
@@ -373,6 +417,95 @@ class PdfParser:
             )
         return regions
 
+    def _ocr_page(
+        self, document: Any, index: int, number: int, result: ParseResult
+    ) -> list[_Line] | None:
+        """Render a page and read it with the configured OCR backend.
+
+        Returns None when OCR is unavailable or finds nothing, so the caller falls back
+        to flagging the page. Failing the whole document because one appendix page could
+        not be recognised is the wrong trade every time: the rest is still worth having,
+        and the warning records exactly what was lost.
+        """
+        if not self.ocr.available():
+            return None
+
+        import io
+
+        scale = self.ocr_dpi / 72.0
+        try:
+            page = document[index]
+            try:
+                buffer = io.BytesIO()
+                page.render(scale=scale).to_pil().save(buffer, format="PNG")
+                rendered = buffer.getvalue()
+                height_points = page.get_height()
+            finally:
+                page.close()
+        except Exception as exc:  # noqa: BLE001 - a render failure is not a bad document
+            result.warn(
+                "ocr_render_failed",
+                f"page {number} could not be rendered for OCR: {exc}",
+                page=number,
+            )
+            return None
+
+        try:
+            recognised = self.ocr.read(rendered, dpi=self.ocr_dpi)
+        except OcrUnavailable as exc:
+            result.warn("ocr_unavailable", f"page {number}: {exc}", page=number)
+            return None
+
+        if self.render_page_images:
+            result.page_images[number] = rendered
+
+        if not recognised.lines:
+            result.warn(
+                "ocr_found_no_text",
+                f"page {number} was rendered and OCR'd but no text was recognised",
+                page=number,
+            )
+            return None
+
+        confidence = recognised.confidence
+        result.warn(
+            "page_ocr_applied",
+            f"page {number} was read by {recognised.engine}"
+            + (f" at confidence {confidence:.2f}" if confidence is not None else ""),
+            page=number,
+        )
+        return self._lines_from_ocr(recognised, number, scale, height_points)
+
+    def _lines_from_ocr(
+        self, recognised: Any, number: int, scale: float, height_points: float
+    ) -> list[_Line]:
+        """Convert OCR output into the same `_Line` shape a text layer produces.
+
+        Two conversions, both easy to get silently wrong. Pixels become points by
+        dividing by the render scale. Top-left origin becomes bottom-left by subtracting
+        from the page height — OCR engines measure down from the top, PDF measures up
+        from the bottom, and skipping the flip inverts the page so every paragraph break
+        and every table overlap lands somewhere else.
+
+        `size` is the line box height, the only size signal OCR offers. It is weaker than
+        a declared font size, for the same reason glyph boxes were wrong on digital
+        pages, so heading inference on a scan is correspondingly less certain — and
+        degrading to `paragraph` is the right way to be wrong.
+        """
+        return [
+            _Line(
+                text=line.text,
+                size=line.height / scale,
+                indent=line.left / scale,
+                right=line.right / scale,
+                top=height_points - (line.top / scale),
+                bottom=height_points - (line.bottom / scale),
+                page=number,
+                confidence=line.confidence,
+            )
+            for line in recognised.lines
+        ]
+
     def _has_images(self, page: Any) -> bool:
         """Whether anything is drawn on the page besides text.
 
@@ -477,8 +610,16 @@ class PdfParser:
                 return
             text = join_wrapped("\n".join(line.text for line in paragraph))
             if text:
+                scores = [
+                    line.confidence for line in paragraph if line.confidence is not None
+                ]
                 sink().append(
-                    RawBlock(type=BlockType.PARAGRAPH, text=text, page=paragraph[0].page)
+                    RawBlock(
+                        type=BlockType.PARAGRAPH,
+                        text=text,
+                        page=paragraph[0].page,
+                        confidence=(sum(scores) / len(scores)) if scores else None,
+                    )
                 )
             paragraph.clear()
 
