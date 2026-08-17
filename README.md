@@ -1,20 +1,22 @@
 # parsing-service
 
 Turns an uploaded document into structured content the planning service can consume.
-Raw files come from S3, jobs from Kafka, and parsed content goes out over HTTP — this
-API is the only path from a raw upload to document content.
 
-Full design, including the parts not built yet: [DESIGN.md](DESIGN.md).
+**Stateless.** A job arrives on Kafka, the raw file is fetched from S3, and the parse
+produces two things: a content-addressed artifact in S3 and one outcome event back on
+Kafka. There is no database here — the document's status, run history and tenancy live
+upstream in the service that owns the upload, and `documents.parse.completed` /
+`documents.parse.failed` are the only things it hears from this one.
 
 ```bash
-pip install -e ".[dev,docx,pdf,xlsx,s3,api,db,kafka]"
+pip install -e ".[dev,docx,pdf,xlsx,s3,api,kafka]"
 cp .env.example .env                      # then fill in S3_BUCKET and AWS_REGION
-python -m pytest -q                       # 258 tests, all offline
+python -m pytest -q                       # 277 tests, all offline
 
-PYTHONPATH=src python -m work.main --check         # preflight: S3, DB, broker, topic
+PYTHONPATH=src python -m work.main --check         # preflight: S3, broker, topics
 PYTHONPATH=src python -m work.main                 # consume events and parse
 PYTHONPATH=src python -m work.main --once          # one message, then exit
-uvicorn api.main:app --app-dir src --port 8000     # serve parsed content
+uvicorn api.main:app --app-dir src --port 8000     # serve parsed content (internal only)
 
 python examples/parse_file.py spec.pdf                        # outline + metadata
 python examples/parse_file.py spec.pdf --text                 # the canonical text
@@ -38,30 +40,26 @@ python examples/parse_file.py "https://...presigned-url..."    # via plain HTTP
 | **Fetch from S3, presigned URLs, local — with SSRF guards and size caps** | ✅ |
 | PDF table extraction (ruled tables, de-duplicated from the text flow) | ✅ |
 | OCR — pluggable backend, per-page, confidence to the consumer | ✅ |
-| Status machine, run history, idempotent claim | ✅ |
-| Worker: fetch → parse → persist → commit, retry tiers, DLQ | ✅ |
+| Worker: fetch → parse → store → announce → commit, retry tiers, DLQ | ✅ |
 | Content-addressed artifact store (S3 + local) | ✅ |
-| HTTP API — status, batch, content, text, locate, reprocess, delete | ✅ |
-| Postgres repository + migrations | ⚠️ written, needs a live DB to verify |
-| Kafka/Redpanda adapter | ⚠️ written, needs a broker to verify |
+| Idempotency from the artifact key — no database | ✅ |
+| Outcome events: `parse.completed`, `parse.failed` | ✅ verified against a live broker |
+| HTTP API — content, text, locate, page images | ✅ |
+| Kafka/Redpanda adapter | ✅ verified against a live broker |
 | Config from `.env`, worker and API entrypoints | ✅ |
-| Cleanup worker for the delete cascade | ⬜ |
 | Metrics endpoint, tracing | ⬜ |
 
 The parse stage stays pure — bytes in, artifact out, no I/O — which is what lets it be
 tested without infrastructure and what makes job replay safe. Everything that touches the
 world (`src/store/`, `src/work/`) sits outside it.
 
-**On the two ⚠️ rows.** This was built in an environment with no Postgres server, no Kafka
-broker and no `tesseract` binary, so those three adapters are written but have not been
-executed. What *is* verified is the logic they drive: `InMemoryRepository` is a real
-implementation (its claim is a conditional update, its `start_run` raises on the unique
-key), the worker's ordering and retry routing run against it, and every OCR test runs
-against a fake backend. Postgres, Kafka and S3 all run outside this repo — there is no compose file. Point
-`.env` at them (`.env.example` documents every variable) and run
-`python -m work.main --check`, which resolves the config and reaches each dependency
-before consuming anything. Run `tests/test_postgres.py` against the live database before
-trusting the SQL.
+**Why there is no database.** Parsing is a pure function of the raw bytes, the parser
+version and the parse options, and the artifact key is built from exactly those three
+things. So "have we already done this?" is a `HeadObject`, not a row — which is what the
+claim gate, the lease and the `parse_runs` unique constraint used to answer. Everything
+else the tables held was a *query surface*, and a query surface belongs with the service
+that owns the documents. `tesseract` is still absent from the environment this was built
+in, so OCR runs against a fake backend in tests; Kafka and S3 are both verified live.
 
 ## The one idea worth knowing
 
@@ -153,6 +151,10 @@ missing any of them is dead-lettered by name rather than retried — republishin
 with no `s3_key` produces the same event. Unknown fields are ignored, so the producer can
 add one without a coordinated deploy.
 
+`force: true` and `parse_options` are read from this event too, which is what makes a
+reprocess work: without `force`, a re-request for bytes already parsed at this version finds
+the artifact in place and is answered from it rather than re-parsed.
+
 Try it without a broker:
 
 ```bash
@@ -160,33 +162,85 @@ PYTHONPATH=src python -m work.main --event event.json
 ```
 
 `--check` is the preflight worth running first. It resolves the config, does a
-`HeadBucket`, connects to the database, and probes the broker — including two failures
-that otherwise look like a broken client:
+`HeadBucket`, and probes the broker — including three failures that otherwise look like a
+broken client:
 
 - **the topic does not exist**, so the worker would start cleanly, log nothing, and
   process nothing forever;
 - **the broker advertises a loopback address**, so metadata requests succeed while every
   produce and consume connects to `127.0.0.1` and is refused. Fixed on the broker with
-  `advertised.listeners=PLAINTEXT://<its-own-ip>:9092`, not in this client.
+  `advertised.listeners=PLAINTEXT://<its-own-ip>:9092`, not in this client;
+- **an outcome topic does not exist**, which on a broker with auto-creation disabled means
+  every completed or failed parse is published into nothing. Since the event is now the only
+  record, that is a document upstream never hears about at all.
+
+## The outcome events
+
+Two topics, and between them they are the entire output of this service besides the artifact.
+Both are keyed on `document_id`, matching the requested topic, so a consumer joining the
+streams sees them partitioned the same way.
+
+`documents.parse.completed` carries everything needed to act without a round-trip:
+
+```json
+{
+  "document_id": "ecce67d1-…", "tenant_id": "11111111-…", "project_id": "0c9d0601-…",
+  "run_id": "b713ad83-…",
+  "content_hash": "dc7720161209a62b…",
+  "artifact_key": "parsed/dc7720161209a62b…/1.0/document.json",
+  "status": "ready",
+  "metadata": { "format": "pdf", "page_count": 2, "char_count": 215, "ocr_applied": false },
+  "warnings": [], "duplicate": false,
+  "completed_at": "2026-08-17T11:00:56.776983+00:00",
+  "event_id": "…", "trace_id": "…"
+}
+```
+
+`documents.parse.failed` is emitted only on a **terminal** outcome — a permanent failure, or
+transient retries exhausted. An intermediate transient failure announces nothing, because it
+is still being worked on and flapping a document into `failed` would show a user a failure
+that fixes itself thirty seconds later.
+
+```json
+{
+  "document_id": "e0992264-…", "status": "failed",
+  "failure_class": "not_found",
+  "failure_reason": "s3://…/definitely-not-here.pdf does not exist",
+  "permanent": true, "attempt": 1,
+  "run_id": null, "content_hash": null,
+  "tenant_id": "11111111-…", "failed_at": "…"
+}
+```
+
+`permanent: false` means the tiers ran out rather than the document being unparseable —
+usually our infrastructure, and often worth replaying after a fix. `run_id` and
+`content_hash` are null when the failure happened before any bytes were fetched, which is
+what separates "could not read the file" from "read it and could not parse it".
+
+**A duplicate is still announced.** The old worker answered a replay from the database and
+published nothing. With events as the only output that silence is unsafe: a lost message
+would be unrecoverable, because republishing the request would find the artifact present and
+say nothing at all. So a replay re-reads the existing artifact and re-emits the same event
+with `duplicate: true`. One GET, and replay becomes a working recovery path.
 
 ## Tenancy
 
-`tenant_id` scopes every read and write. Two layers, deliberately:
+`tenant_id` arrives on the upload event, travels through the job, and leaves on the outcome
+event — which is the only place it exists once this service commits the offset. Drop it
+anywhere along that path and upstream receives a result it cannot attribute to anyone.
 
-- **Postgres RLS** ([`002_tenancy.sql`](src/store/migrations/002_tenancy.sql)) is the real
-  enforcement. The service connects as `eos_app` and sets `app.tenant_id` per transaction
-  with `SET LOCAL` — `LOCAL`, because connections are pooled and a `SESSION` setting would
-  leak the previous request's tenant into the next one. Policies carry `WITH CHECK` as well
-  as `USING`, or a session scoped to tenant A could *insert* a row labelled tenant B.
-- **The API and repository scope explicitly too.** RLS does not apply to the table owner,
-  so pointing `DATABASE_URL` at `postgres` silently disables every policy — the redundant
-  `WHERE tenant_id = …` is what still holds if that happens, and it is what
-  [`tests/test_tenancy.py`](tests/test_tenancy.py) can actually exercise.
+**This service enforces nothing**, because it has no store to enforce against. Upstream owns
+the documents table and therefore owns tenancy. One consequence is a security property worth
+stating plainly:
 
-Reads are scoped by an `X-Tenant-Id` header the gateway sets — not a URL or body field,
-which the caller controls. A cross-tenant read is **404, not 403**: confirming a document
-exists is itself a disclosure. `REQUIRE_TENANT_HEADER=true` rejects an unscoped read
-outright.
+> Content is addressed by hash, so a `content_hash` is a bearer capability, and two tenants
+> who upload the same file share one artifact. The read API cannot check that a caller is
+> entitled to a hash — there is no row to check against. Keep it on an internal network with
+> upstream proxying reads, or namespace artifact keys per tenant and give up cross-tenant
+> dedup. An unguessable hash is not access control: hashes travel in events, logs and traces.
+
+`X-Tenant-Id` is deliberately *not* accepted. A header this service cannot verify would look
+like an authorisation check while being none, which is worse than plainly having no check.
 
 ## Fetching the raw file
 
@@ -240,11 +294,25 @@ src/store/
   refs.py         s3:// · presigned https:// · file:// → a typed reference
   net.py          the SSRF guard
   blobs.py        fetch with size caps, streaming hash, classified failures
-tests/            167 tests; fixtures are generated in code, not binary blobs
+  artifacts.py    ★ the content-addressed key — which is also the idempotency check
+src/work/
+  queue.py        Job · CompletionEvent · FailureEvent · retry tiers
+  worker.py       fetch → dedup → parse → store → announce
+  kafka.py        the broker adapter
+src/api/          content · text · locate · page images, all addressed by hash
+tests/            277 tests; fixtures are generated in code, not binary blobs
 ```
 
 `serialize.py` is the file to guard hardest: it is the only place spans are produced,
 and its bugs are the kind that keep all the content while moving the offsets.
+
+`artifacts.py` is second. The key it builds is now load-bearing twice over — it addresses
+the object *and* answers "already parsed?" — so a key that does not include everything the
+parse depends on means either a re-parse that never happens or one that silently overwrites
+a different result. That is why `parse_options` is a segment of it, and why the worker's
+`parser_version` overrides each parser's own: if the version in the key and the version in
+the metadata could differ, the dedup check would read one key and the write would go to
+another, so nothing would ever deduplicate.
 
 ## A note on PDF
 

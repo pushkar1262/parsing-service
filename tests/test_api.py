@@ -1,9 +1,13 @@
 """The HTTP surface, end to end, against real collaborators.
 
-Nothing is mocked here: a real worker parses a real file into a real artifact store, and
-the API serves it. The only thing missing is infrastructure — the repository is in-memory
-and the queue is a list — so these tests exercise the actual request paths a consumer
-will use.
+Nothing is mocked: a real worker parses a real file into a real artifact store, and the API
+serves it back. The only thing missing is infrastructure, so these tests exercise the actual
+request paths a consumer will use.
+
+The API is now content-addressed — `content_hash` plus parser version is the whole address,
+because that is exactly what the artifact key is built from. Status, batch status, run
+history, reprocess and delete are not here: they moved upstream with the database that
+answered them.
 """
 
 from __future__ import annotations
@@ -18,11 +22,9 @@ pytest.importorskip("httpx", reason="TestClient needs httpx")
 from fastapi.testclient import TestClient
 
 from api.app import Services, create_app
-from domain.status import DocumentStatus, ParseRun
 from store.artifacts import LocalArtifactStore
 from store.blobs import FetchPolicy, Storage
-from store.repository import InMemoryRepository
-from work.queue import TOPIC_REQUESTED, InMemoryQueue, Job
+from work.queue import InMemoryQueue, Job
 from work.worker import Worker
 
 SPEC = b"""# Merchant Onboarding
@@ -35,6 +37,8 @@ The system must authenticate users within 300ms.
 - Rotate API keys every 90 days
 """
 
+ABSENT = "0" * 64
+
 
 @pytest.fixture
 def api(tmp_path: Path):
@@ -42,90 +46,33 @@ def api(tmp_path: Path):
     inbox.mkdir()
     (inbox / "spec.md").write_bytes(SPEC)
 
-    repository = InMemoryRepository()
     artifacts = LocalArtifactStore(tmp_path / "artifacts")
     queue = InMemoryQueue()
     worker = Worker(
-        repository=repository,
         storage=Storage(FetchPolicy(local_roots=(inbox,))),
         artifacts=artifacts,
         publisher=queue,
     )
     outcome = worker.process(
-        Job(document_id="doc-1", reference=str(inbox / "spec.md"))
+        Job(
+            document_id="doc-1",
+            reference=str(inbox / "spec.md"),
+            tenant_id="11111111-1111-1111-1111-111111111111",
+        )
     )
     assert outcome.ok
 
-    # A second document that failed, so the not-ready paths are real rather than staged.
-    repository.register("doc-broken")
-    repository.claim("doc-broken")
-    run = repository.start_run(
-        ParseRun(
-            id="run-b",
-            document_id="doc-broken",
-            content_hash="h",
-            parser_version="1.0",
-        )
-    )
-    repository.fail_run(
-        run.id,
-        failure_class="unsupported_format",
-        failure_reason="no parser for application/x-dvi",
-        permanent=True,
-    )
+    # The hash is what a consumer gets on the completion event, so that is what the tests
+    # address the content with.
+    event = queue.events_in("documents.parse.completed")[0]
 
-    app = create_app(
-        Services(repository=repository, artifacts=artifacts, publisher=queue)
-    )
+    app = create_app(Services(artifacts=artifacts, parser_version="1.0"))
     return {
         "client": TestClient(app),
-        "repository": repository,
-        "queue": queue,
+        "hash": event.content_hash,
         "artifacts": artifacts,
+        "queue": queue,
     }
-
-
-# --------------------------------------------------------------------------- #
-# status
-# --------------------------------------------------------------------------- #
-
-
-def test_status_reports_a_ready_document(api) -> None:
-    body = api["client"].get("/v1/documents/doc-1").json()
-    assert body["status"] == "ready"
-    assert body["readable"] is True
-    assert body["content_hash"]
-    assert body["metadata"]["format"] == "markdown"
-
-
-def test_status_reports_a_failure_with_its_reason(api) -> None:
-    body = api["client"].get("/v1/documents/doc-broken").json()
-    assert body["status"] == "failed"
-    assert body["readable"] is False
-    assert body["failure_class"] == "unsupported_format"
-    assert "x-dvi" in body["failure_reason"]
-
-
-def test_an_unknown_document_is_404(api) -> None:
-    assert api["client"].get("/v1/documents/nope").status_code == 404
-
-
-def test_batch_status_answers_a_document_set_in_one_call(api) -> None:
-    """The planning service runs one agent per document over a set."""
-    response = api["client"].get("/v1/documents?ids=doc-1,doc-broken")
-    assert response.status_code == 200
-    assert {b["document_id"] for b in response.json()} == {"doc-1", "doc-broken"}
-
-
-def test_batch_status_skips_unknown_ids_rather_than_failing(api) -> None:
-    """One deleted document in a set should not blind the caller to the rest."""
-    body = api["client"].get("/v1/documents?ids=doc-1,ghost").json()
-    assert [b["document_id"] for b in body] == ["doc-1"]
-
-
-def test_batch_status_refuses_an_unbounded_request(api) -> None:
-    ids = ",".join(f"d{i}" for i in range(501))
-    assert api["client"].get(f"/v1/documents?ids={ids}").status_code == 400
 
 
 # --------------------------------------------------------------------------- #
@@ -134,73 +81,70 @@ def test_batch_status_refuses_an_unbounded_request(api) -> None:
 
 
 def test_content_returns_the_artifact(api) -> None:
-    body = api["client"].get("/v1/documents/doc-1/content").json()
+    body = api["client"].get(f"/v1/content/{api['hash']}").json()
     assert "authenticate users within 300ms" in body["text"]
     assert body["blocks"]
-    assert body["metadata"]["heading_count"] == 2
+    assert body["content_hash"] == api["hash"]
 
 
 def test_text_returns_the_canonical_string_alone(api) -> None:
-    """What `ExtractRequest.document` takes today, so adoption needs no restructuring."""
-    response = api["client"].get("/v1/documents/doc-1/text")
-    assert response.status_code == 200
-    assert response.text.startswith("# Merchant Onboarding")
+    response = api["client"].get(f"/v1/content/{api['hash']}/text")
+    assert response.headers["content-type"].startswith("text/plain")
+    assert "Rotate API keys every 90 days" in response.text
 
 
 def test_include_can_drop_blocks_for_a_smaller_payload(api) -> None:
-    body = api["client"].get("/v1/documents/doc-1/content?include=text").json()
+    body = api["client"].get(f"/v1/content/{api['hash']}?include=text").json()
     assert "text" in body
     assert "blocks" not in body
 
 
-def test_content_for_a_failed_document_is_409_not_an_empty_document(api) -> None:
-    """An empty 200 is indistinguishable from a document that says nothing.
+def test_unparsed_content_is_404_naming_the_coordinates(api) -> None:
+    """Never parsed and parsed-at-another-version are both "not here" to a caller, so the
+    body names both coordinates rather than leaving the difference undiagnosable."""
+    response = api["client"].get(f"/v1/content/{ABSENT}")
+    assert response.status_code == 404
+    assert ABSENT in response.json()["detail"]
+    assert "1.0" in response.json()["detail"]
 
-    The planning service would extract zero requirements and report, correctly from what
-    it was given, that the document contains none.
-    """
-    response = api["client"].get("/v1/documents/doc-broken/content")
-    assert response.status_code == 409
-    detail = response.json()["detail"]
-    assert detail["status"] == "failed"
-    assert detail["failure_class"] == "unsupported_format"
+
+def test_an_older_parser_version_can_still_be_read(api) -> None:
+    """A consumer pinned mid-rollout must not have its reads start 404ing."""
+    ok = api["client"].get(f"/v1/content/{api['hash']}?parser_version=1.0")
+    missing = api["client"].get(f"/v1/content/{api['hash']}?parser_version=9.9")
+    assert ok.status_code == 200
+    assert missing.status_code == 404
+
+
+# --------------------------------------------------------------------------- #
+# etags
+# --------------------------------------------------------------------------- #
 
 
 def test_the_etag_makes_a_repeat_read_free(api) -> None:
-    first = api["client"].get("/v1/documents/doc-1/content")
+    first = api["client"].get(f"/v1/content/{api['hash']}")
     etag = first.headers["etag"]
     assert etag
 
-    second = api["client"].get(
-        "/v1/documents/doc-1/content", headers={"If-None-Match": etag}
+    again = api["client"].get(
+        f"/v1/content/{api['hash']}", headers={"If-None-Match": etag}
     )
-    assert second.status_code == 304
+    assert again.status_code == 304
 
 
-def test_the_etag_changes_when_a_reprocess_lands(api) -> None:
-    """It is `content_hash:parser_version`, so new content invalidates it."""
-    before = api["client"].get("/v1/documents/doc-1/content").headers["etag"]
+def test_the_etag_is_derived_from_the_address_not_the_body(api) -> None:
+    """Content-addressed means the ETag can be computed without reading the object, which
+    is what makes a 304 genuinely free rather than a read followed by a discard."""
+    etag = api["client"].get(f"/v1/content/{api['hash']}").headers["etag"]
+    assert api["hash"] in etag
+    assert "1.0" in etag
 
-    repository = api["repository"]
-    run = repository.start_run(
-        ParseRun(
-            id="run-2",
-            document_id="doc-1",
-            content_hash="different",
-            parser_version="2.0",
-        )
+    other = api["client"].get(
+        f"/v1/content/{api['hash']}?parser_version=9.9",
+        headers={"If-None-Match": etag},
     )
-    # Point at a real artifact so the read succeeds.
-    document = api["artifacts"].get(
-        repository.get_run(repository.get("doc-1").current_run_id).artifact_key
-    )
-    document.content_hash = "different"
-    document.metadata.parser_version = "2.0"
-    key = api["artifacts"].put(document)
-    repository.complete_run(run.id, artifact_key=key, content_hash="different")
-
-    after = api["client"].get("/v1/documents/doc-1/content").headers["etag"]
-    assert after != before
+    # A different version is a different address, so the stale ETag must not match it.
+    assert other.status_code == 404
 
 
 # --------------------------------------------------------------------------- #
@@ -209,77 +153,101 @@ def test_the_etag_changes_when_a_reprocess_lands(api) -> None:
 
 
 def test_locate_resolves_quotes_to_spans_and_blocks(api) -> None:
-    response = api["client"].post(
-        "/v1/documents/doc-1/locate",
-        json={"quotes": ["authenticate users within 300ms", "biometric login"]},
+    body = (
+        api["client"]
+        .post(
+            f"/v1/content/{api['hash']}/locate",
+            json={"quotes": ["Rotate API keys every 90 days"]},
+        )
+        .json()
     )
-    assert response.status_code == 200
-    results = response.json()["results"]
-    assert results[0]["found"] is True
-    assert results[0]["match"] == "exact"
-    assert results[0]["block_id"]
-    assert results[1]["found"] is False
+    result = body["results"][0]
+    assert result["found"] is True
+    assert result["match"] == "exact"
+    assert result["span"][0] < result["span"][1]
+    assert result["block_id"]
 
 
 def test_locate_snaps_a_near_miss_to_real_source_text(api) -> None:
-    """One imperfect quote should not discard a whole extraction."""
-    response = api["client"].post(
-        "/v1/documents/doc-1/locate",
-        json={"quotes": ["Rotate API keys every 90 dayz"]},
+    """One imperfect quote must not discard a whole extraction, and nothing absent from the
+    document is ever returned."""
+    body = (
+        api["client"]
+        .post(
+            f"/v1/content/{api['hash']}/locate",
+            json={"quotes": ["Rotate API keys every 90 dayz"]},
+        )
+        .json()
     )
-    result = response.json()["results"][0]
+    result = body["results"][0]
     assert result["match"] == "snapped"
     assert result["text"] == "Rotate API keys every 90 days"
+    assert result["similarity"] < 1.0
+
+
+def test_locate_reports_an_absent_quote_rather_than_inventing_one(api) -> None:
+    body = (
+        api["client"]
+        .post(
+            f"/v1/content/{api['hash']}/locate",
+            json={"quotes": ["support for SAML single sign-on"]},
+        )
+        .json()
+    )
+    assert body["results"][0]["found"] is False
+    assert body["results"][0]["span"] is None
 
 
 def test_locate_requires_at_least_one_quote(api) -> None:
-    assert api["client"].post("/v1/documents/doc-1/locate", json={"quotes": []}).status_code == 422
+    response = api["client"].post(
+        f"/v1/content/{api['hash']}/locate", json={"quotes": []}
+    )
+    assert response.status_code == 422
+
+
+def test_locate_on_unparsed_content_is_404(api) -> None:
+    response = api["client"].post(
+        f"/v1/content/{ABSENT}/locate", json={"quotes": ["anything"]}
+    )
+    assert response.status_code == 404
 
 
 # --------------------------------------------------------------------------- #
-# reprocess, delete, history
+# the endpoints that moved upstream
 # --------------------------------------------------------------------------- #
 
 
-def test_reprocess_publishes_a_job_and_leaves_the_document_ready(api) -> None:
-    """The rule the run/document split exists for, at the API level."""
-    response = api["client"].post("/v1/documents/doc-1/reprocess")
-    assert response.status_code == 202
-
-    assert api["queue"].count(TOPIC_REQUESTED) == 1
-    assert api["queue"].jobs_in(TOPIC_REQUESTED)[0].document_id == "doc-1"
-    # Still ready, still serving.
-    assert api["repository"].get("doc-1").status is DocumentStatus.READY
-    assert api["client"].get("/v1/documents/doc-1/content").status_code == 200
-
-
-def test_reprocess_can_force_past_the_idempotency_gate(api) -> None:
-    """What you want after fixing a parser bug without cutting a version."""
-    api["client"].post("/v1/documents/doc-1/reprocess", json={"force": True})
-    assert api["queue"].jobs_in(TOPIC_REQUESTED)[0].force is True
-
-
-def test_runs_history_is_exposed(api) -> None:
-    body = api["client"].get("/v1/documents/doc-1/runs").json()
-    assert len(body) == 1
-    assert body[0]["status"] == "succeeded"
-    assert body[0]["artifact_key"]
+@pytest.mark.parametrize(
+    "method,path",
+    [
+        ("get", "/v1/documents/doc-1"),
+        ("get", "/v1/documents"),
+        ("get", "/v1/documents/doc-1/runs"),
+        ("post", "/v1/documents/doc-1/reprocess"),
+        ("delete", "/v1/documents/doc-1"),
+    ],
+)
+def test_the_stateful_routes_are_gone(api, method: str, path: str) -> None:
+    """Explicit, so a caller still pointing here fails loudly rather than being quietly
+    served something plausible. These now live upstream, which owns the documents table."""
+    response = getattr(api["client"], method)(path)
+    assert response.status_code == 404
 
 
-def test_delete_makes_the_document_gone_immediately(api) -> None:
-    assert api["client"].delete("/v1/documents/doc-1").status_code == 202
-    # 410, not 404: "deliberately removed" and "never existed" are different answers,
-    # and only one of them should stop a client retrying.
-    assert api["client"].get("/v1/documents/doc-1").status_code == 410
-    assert api["client"].get("/v1/documents/doc-1/content").status_code == 410
-
-
-def test_deleting_an_unknown_document_is_404(api) -> None:
-    assert api["client"].delete("/v1/documents/ghost").status_code == 404
+def test_no_tenant_header_is_accepted_or_required(api) -> None:
+    """A header this service cannot verify would look like an authorisation check while
+    being none, which is worse than plainly having no check at all. Tenancy is enforced
+    upstream; this app must not be publicly exposed."""
+    scoped = api["client"].get(
+        f"/v1/content/{api['hash']}",
+        headers={"X-Tenant-Id": "99999999-9999-9999-9999-999999999999"},
+    )
+    unscoped = api["client"].get(f"/v1/content/{api['hash']}")
+    assert scoped.status_code == unscoped.status_code == 200
 
 
 # --------------------------------------------------------------------------- #
-# health
+# probes
 # --------------------------------------------------------------------------- #
 
 

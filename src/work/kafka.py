@@ -12,8 +12,11 @@ documents from one that reprocesses the same document forever.
 default, the broker decides the consumer is dead, the group rebalances, and another worker
 starts the same document *while the first is still running*. It produces duplicate work
 and rebalance storms, and running more workers makes it worse rather than better, because
-the eviction disturbs the whole group. So: `max.poll.records = 1`, a poll interval above
-the worst-case document, and a hard per-document timeout strictly below it.
+the eviction disturbs the whole group. So: a poll interval above the worst-case document,
+and a hard per-document timeout strictly below it. The "one document per poll" half of that
+is free here — librdkafka's `poll()` returns a single message, so there is no batch whose
+worst case has to fit inside the interval. (The Java client's `max.poll.records` has no
+librdkafka equivalent, and passing it is a fatal config error rather than a no-op.)
 
 **`enable.auto.commit = false`**, because the offset must be committed after the database
 write, and auto-commit commits on a timer that knows nothing about whether the work
@@ -42,6 +45,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
+from domain.errors import StorageUnavailable
 from work.queue import RETRY_TIERS, TOPIC_DLQ, TOPIC_REQUESTED, Job, MalformedEvent, Message
 from work.worker import Disposition, Outcome, Worker
 
@@ -70,10 +74,9 @@ class KafkaConfig:
             "client.id": self.client_id,
             # Commit explicitly, after the database write. See the module docstring.
             "enable.auto.commit": False,
-            # One document per poll, so the interval below covers exactly one document
-            # rather than a batch whose worst case is unbounded.
+            # Covers exactly one document: `poll()` hands back a single message, so there
+            # is no batch here whose worst case would have to fit in this interval.
             "max.poll.interval.ms": MAX_POLL_INTERVAL_MS,
-            "max.poll.records": 1,
             # Start at the beginning for a new group: a document published before this
             # consumer existed still needs parsing.
             "auto.offset.reset": "earliest",
@@ -113,10 +116,24 @@ class KafkaPublisher:
             value=message.value,
             headers=[(k, v.encode("utf-8")) for k, v in message.headers.items()],
         )
-        # Flush per message rather than batching. A retry that is still sitting in a
-        # producer buffer when the process dies is a document that stops retrying, and
+        # Flush per message rather than batching. An outcome still sitting in a producer
+        # buffer when the process dies is a document upstream never hears about, and
         # throughput is bounded by parsing rather than by publishing anyway.
-        self._handle().flush(10)
+        pending = self._handle().flush(10)
+        if pending:
+            # Do not let this pass quietly. The offset is about to be committed on the
+            # strength of this publish having happened, and a silently dropped completion
+            # event is a document stuck in `pending` upstream with nothing to explain it.
+            raise StorageUnavailable(
+                f"{pending} message(s) still unflushed after 10s publishing to "
+                f"{message.topic!r}; the broker may be unreachable or the topic may not "
+                f"exist with auto-creation disabled"
+            )
+
+    def close(self) -> None:
+        """Flush anything outstanding. Safe to call when nothing was ever produced."""
+        if self._producer is not None:
+            self._producer.flush(10)
 
 
 class KafkaWorkerLoop:
@@ -146,6 +163,19 @@ class KafkaWorkerLoop:
 
     def run(self, *, max_messages: int | None = None) -> int:
         """The loop. `max_messages` exists so a test or a drain job can bound it."""
+        try:
+            return self._run(max_messages=max_messages)
+        finally:
+            # Closing the consumer commits nothing extra but *leaves the group cleanly*,
+            # which is the difference between an immediate rebalance and every other member
+            # waiting out `session.timeout.ms` before the partitions move. It also releases
+            # librdkafka's background threads, without which the process does not exit —
+            # found exactly that way, as a `--once` run that handled its message and then
+            # hung until it was killed.
+            if self._consumer is not None:
+                self._consumer.close()
+
+    def _run(self, *, max_messages: int | None = None) -> int:
         consumer = self._handle()
         self._running = True
         handled = 0

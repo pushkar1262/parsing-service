@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from config import ConfigError, Settings, _redact_url
+from config import ConfigError, Settings
 
 ENV = {
     "S3_BUCKET": "acme-uploads",
@@ -188,14 +188,11 @@ def test_the_repr_of_settings_does_not_carry_the_secret(settings) -> None:
     assert ENV["AWS_SECRET_ACCESS_KEY"] not in repr(settings)
 
 
-def test_a_database_password_is_redacted(settings) -> None:
-    """Logging the URL as-is on startup is normal, and puts the password in the logs."""
-    assert (
-        _redact_url("postgresql://parsing:s3cr3t@db.internal:5432/parsing")
-        == "postgresql://***@db.internal:5432/parsing"
-    )
-    assert _redact_url("postgresql://localhost/parsing") == "postgresql://localhost/parsing"
-    assert _redact_url("") is None
+def test_describe_carries_no_database_settings(settings) -> None:
+    """There is no database. Any of these surviving in the resolved config would mean a
+    deployment still has one wired up and expects it to be used."""
+    described = settings.describe()
+    assert not [k for k in described if "database" in k or "tenant" in k]
 
 
 def test_describe_reports_which_credential_source_is_in_use(settings) -> None:

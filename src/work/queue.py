@@ -22,6 +22,7 @@ from typing import Any, Protocol, runtime_checkable
 
 TOPIC_REQUESTED = "documents.parse.requested"
 TOPIC_COMPLETED = "documents.parse.completed"
+TOPIC_FAILED = "documents.parse.failed"
 TOPIC_DELETED = "documents.deleted"
 TOPIC_DLQ = "documents.parse.dlq"
 
@@ -41,10 +42,11 @@ class Job:
     because a 90 MB PDF has no business inside a Kafka message and because the raw file
     must stay retrievable for reprocessing long after the message is gone.
 
-    `tenant_id` is not decoration. It scopes every read and write, and on Postgres it is
-    what the row-level security policy matches against — a job arriving without one can
-    only be processed by disabling the isolation that keeps one customer's documents out
-    of another's results.
+    `tenant_id` is not decoration, and it matters more now than when there was a database to
+    hold it. It arrives on the upload event, travels through the job, and leaves on the
+    outcome event — which is the only place it exists once this service commits the offset.
+    Drop it anywhere along that path and upstream receives a result it cannot attribute to
+    anyone, so it can neither store it nor serve it.
     """
 
     document_id: str
@@ -95,11 +97,11 @@ class Job:
     def from_event(cls, payload: dict[str, Any]) -> Job:
         """Map the upload backend's event onto a job.
 
-        Strict about the three fields that cannot be guessed. A missing `s3_key` produces
-        a job that fails looking like a storage problem; a missing `tenant_id` produces one
-        that either leaks across tenants or trips an RLS check with a confusing message. All
-        three are refused here, where the message is still in hand and can be dead-lettered
-        with a reason naming the field.
+        Strict about the fields that cannot be guessed. A missing `s3_key` produces a job
+        that fails looking like a storage problem; a missing `tenant_id` produces an outcome
+        event upstream cannot attribute to any tenant, and so cannot act on. All of them are
+        refused here, where the message is still in hand and can be dead-lettered with a
+        reason naming the field.
         """
         missing = [
             key
@@ -114,6 +116,11 @@ class Job:
         bucket = str(payload["s3_bucket"]).strip()
         key = str(payload["s3_key"]).strip().lstrip("/")
         size = str(payload.get("size") or "")
+        # `force` and `parse_options` are read here, not only from this service's own
+        # serialisation, because reprocessing is driven from upstream now. Without them a
+        # reprocess arrives looking identical to the original request, finds the artifact
+        # already in place, and is skipped — a silent no-op rather than a re-parse.
+        options = payload.get("parse_options")
         return cls(
             document_id=str(payload["document_id"]).strip(),
             # Fully qualified, so no prefix resolution is needed or attempted: the producer
@@ -128,6 +135,8 @@ class Job:
             event_id=_optional(payload.get("event_id")),
             trace_id=_optional(payload.get("trace_id"))
             or _optional(payload.get("event_id")),
+            parse_options=options if isinstance(options, dict) else {},
+            force=bool(payload.get("force")),
         )
 
     @property
@@ -139,6 +148,114 @@ class Job:
         becomes structurally impossible rather than merely unlikely — which is the
         foundation the claim gate builds on.
         """
+        return self.document_id
+
+
+@dataclass
+class CompletionEvent:
+    """A parse finished. Published on `documents.parse.completed`.
+
+    Deliberately not a `Job`. A job describes work still to do — `attempt`, `force`,
+    `not_before`, `parse_options` — and none of that means anything once the work is done,
+    while everything a consumer wants (`run_id`, `artifact_key`, the metadata) is absent
+    from it. Reusing the inbound shape here produced an event carrying four fields that
+    were noise and none of the ones that let a consumer act.
+
+    **`tenant_id` is what makes the event usable at all.** A consumer reacting to this
+    calls the content API, which requires `X-Tenant-Id` and answers a mismatch with 404,
+    not 403. An event without it can only be acted on by a consumer that already knew the
+    tenant — which is the polling this event exists to remove.
+
+    `metadata` is carried so the common case needs no round-trip: a consumer can see
+    `page_count`, `char_count` and `ocr_applied` and decide whether it even wants the
+    content. The status API stays the source of truth; this is a notification, not a
+    replacement for it.
+    """
+
+    document_id: str
+    reference: str
+    run_id: str
+    content_hash: str
+    artifact_key: str
+    status: str
+    tenant_id: str | None = None
+    project_id: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+    # Warning *codes*, not prose: a consumer branches on `ocr_low_confidence`, and the
+    # human-readable message belongs in the artifact where it will not be parsed.
+    warnings: list[str] = field(default_factory=list)
+    # True when this document's bytes were already parsed at this parser version and the
+    # existing artifact was reused. The event is still emitted — see `Worker._duplicate`.
+    duplicate: bool = False
+    completed_at: str | None = None
+    event_id: str | None = None
+    trace_id: str | None = None
+
+    def to_bytes(self) -> bytes:
+        return json.dumps(asdict(self)).encode("utf-8")
+
+    @classmethod
+    def from_bytes(cls, raw: bytes) -> CompletionEvent:
+        payload = json.loads(raw.decode("utf-8"))
+        # Same forward compatibility as `Job`: this service adding a field must not stop
+        # a consumer that was deployed before it.
+        known = {f.name for f in fields(cls)}
+        return cls(**{k: v for k, v in payload.items() if k in known})
+
+    @property
+    def key(self) -> str:
+        """`document_id`, matching the requested topic — so a consumer joining the two
+        streams sees both partitioned the same way."""
+        return self.document_id
+
+
+@dataclass
+class FailureEvent:
+    """A parse will not succeed. Published on `documents.parse.failed`.
+
+    Emitted only on a **terminal** outcome: a permanent failure, or transient retries
+    exhausted. An intermediate transient failure is still being worked on and stays inside
+    the retry tiers — publishing it would have a document flapping into `failed` and back
+    while the tiers are still running, and upstream would show a user a failure that fixes
+    itself ninety seconds later.
+
+    This event is the reason the database can be removed. Without it a permanent failure
+    leaves no trace anywhere except a dead-letter message nobody consumes: the document
+    would sit in `pending` forever, and "stuck" and "failed for a nameable reason" would be
+    indistinguishable from upstream.
+    """
+
+    document_id: str
+    reference: str
+    status: str
+    failure_class: str
+    failure_reason: str
+    # False means the failure is transient and the retry tiers are exhausted. Worth
+    # separating: a permanent failure is a fact about the document, an exhausted one is
+    # usually a fact about our infrastructure and may be worth replaying after a fix.
+    permanent: bool
+    attempt: int = 1
+    tenant_id: str | None = None
+    project_id: str | None = None
+    # Null when the failure happened before parsing began — a fetch that never returned
+    # bytes has no hash and no run.
+    run_id: str | None = None
+    content_hash: str | None = None
+    failed_at: str | None = None
+    event_id: str | None = None
+    trace_id: str | None = None
+
+    def to_bytes(self) -> bytes:
+        return json.dumps(asdict(self)).encode("utf-8")
+
+    @classmethod
+    def from_bytes(cls, raw: bytes) -> FailureEvent:
+        payload = json.loads(raw.decode("utf-8"))
+        known = {f.name for f in fields(cls)}
+        return cls(**{k: v for k, v in payload.items() if k in known})
+
+    @property
+    def key(self) -> str:
         return self.document_id
 
 
@@ -197,6 +314,12 @@ class InMemoryQueue:
 
     def jobs_in(self, topic: str) -> list[Job]:
         return [Job.from_bytes(m.value) for m in self.topics.get(topic, [])]
+
+    def events_in(self, topic: str) -> list[CompletionEvent]:
+        return [CompletionEvent.from_bytes(m.value) for m in self.topics.get(topic, [])]
+
+    def failures_in(self, topic: str = TOPIC_FAILED) -> list[FailureEvent]:
+        return [FailureEvent.from_bytes(m.value) for m in self.topics.get(topic, [])]
 
     def count(self, topic: str) -> int:
         return len(self.topics.get(topic, []))

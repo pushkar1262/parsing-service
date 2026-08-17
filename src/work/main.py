@@ -1,4 +1,4 @@
-"""The worker entrypoint: consume events, fetch from S3, parse, persist.
+"""The worker entrypoint: consume events, fetch from S3, parse, announce the outcome.
 
     python -m work.main                      # consume until stopped
     python -m work.main --once               # one message, then exit
@@ -25,10 +25,9 @@ import time
 from pathlib import Path
 from typing import Any
 
-from config import ConfigError, Settings, _host_of, _role_of
+from config import ConfigError, Settings
 from domain.errors import ServiceError
-from store.repository import InMemoryRepository
-from work.queue import Job
+from work.queue import TOPIC_COMPLETED, TOPIC_FAILED, Job
 from work.worker import Worker
 
 log = logging.getLogger("parsing.worker")
@@ -38,7 +37,8 @@ class JsonFormatter(logging.Formatter):
     """One line, one event, machine-readable.
 
     The extra fields are the point: a message that says "parse failed" without the
-    document id is a message that costs somebody a database query to act on.
+    document id is a message nobody can act on, and there is no longer a table to go and
+    look the rest up in.
     """
 
     _BUILTIN = frozenset(
@@ -68,67 +68,6 @@ def configure_logging(level: str = "INFO") -> None:
     root.setLevel(level.upper())
 
 
-def build_repository(settings: Settings):
-    """Postgres when configured, in-memory otherwise.
-
-    The fallback is for local runs, and it says so loudly: an in-memory repository loses
-    every document's status when the process exits, which is fine for a demo and a
-    catastrophe in production if nobody noticed the warning.
-    """
-    if not settings.database_url:
-        log.warning(
-            "no DATABASE_URL set; using an in-memory repository that forgets everything "
-            "on exit. Set DATABASE_URL for anything but a local run."
-        )
-        return InMemoryRepository()
-
-    try:
-        import psycopg
-    except ImportError as exc:  # pragma: no cover - environment dependent
-        raise ConfigError(
-            f"DATABASE_URL is set but psycopg is not installed; "
-            f"install parsing-service[db] ({exc})"
-        ) from exc
-
-    from store.postgres import PostgresRepository
-
-    # Migrate with the privileged role, then serve with the app role. Two connections
-    # rather than one because eos_app has no CREATE — and because a service holding DDL
-    # privileges it needs once at deploy time is a standing risk for no benefit.
-    def connect(url: str, what: str):
-        """Turn a connection failure into a sentence, not a traceback.
-
-        A worker that cannot reach its database has a configuration problem, and the useful
-        output is which role and which host — not eight frames of psycopg internals with
-        the password redacted out of the middle of them.
-        """
-        try:
-            return psycopg.connect(url)
-        except psycopg.OperationalError as exc:
-            raise ConfigError(
-                f"cannot connect to the {what} database as "
-                f"{_role_of(url) or 'an unnamed role'} at {_host_of(url)}: "
-                f"{str(exc).strip().splitlines()[-1]}"
-            ) from exc
-
-    if settings.database_migrate_url:
-        migrator = PostgresRepository(connect(settings.database_migrate_url, "migration"))
-        try:
-            migrator.migrate()
-        finally:
-            migrator._connection.close()
-    repository = PostgresRepository(connect(settings.database_url, "application"))
-    if not settings.database_migrate_url:
-        # No separate URL: migrate as whoever DATABASE_URL is. Works, and warns, because
-        # a role that can run these migrations is usually also a role RLS does not apply to.
-        log.warning(
-            "no DATABASE_MIGRATE_URL set; running migrations as the application role. "
-            "If that role owns the tables, row-level security is not being enforced."
-        )
-        repository.migrate()
-    return repository
-
-
 def build_publisher(settings: Settings):
     if not settings.kafka_bootstrap_servers:
         log.warning(
@@ -146,11 +85,10 @@ def build_publisher(settings: Settings):
     )
 
 
-def build_worker(settings: Settings, *, repository=None, publisher=None) -> Worker:
+def build_worker(settings: Settings, *, publisher=None) -> Worker:
     settings.require_s3()
     s3 = settings.s3_client()
     return Worker(
-        repository=repository if repository is not None else build_repository(settings),
         storage=settings.storage(s3_client=s3),
         artifacts=settings.artifact_store(s3_client=s3),
         publisher=publisher if publisher is not None else build_publisher(settings),
@@ -185,16 +123,6 @@ def check(settings: Settings) -> int:
 
     formats = settings.registry().media_types()
     print(f"parsers  : {len(formats)} media types")
-
-    if settings.database_url:
-        try:
-            build_repository(settings)
-            print("database : ok")
-        except Exception as exc:  # noqa: BLE001
-            print(f"database : FAIL — {exc}", file=sys.stderr)
-            ok = False
-    else:
-        print("database : not configured (in-memory)")
 
     if not check_queue(settings):
         ok = False
@@ -260,12 +188,26 @@ def check_queue(settings: Settings) -> bool:
             "           can read metadata but every produce and consume will connect to\n"
             "           127.0.0.1 and be refused. Fix on the broker:\n"
             "             advertised.listeners=PLAINTEXT://"
-            f"{sorted(bootstrap_hosts)[0]}:9092",
+            f"{min(bootstrap_hosts)}:9092",
             file=sys.stderr,
         )
         ok = False
 
     topics = sorted(t for t in metadata.topics if not t.startswith("__"))
+
+    # The outcome topics matter as much as the input one now that they are the only record
+    # a document was processed. A broker with auto-creation off and no `parse.failed` topic
+    # loses every permanent failure: the parse is correct, the DLQ fills, and upstream sees
+    # documents that never leave `pending`.
+    for topic in (TOPIC_COMPLETED, TOPIC_FAILED):
+        if topic not in topics:
+            print(
+                f"           WARN — topic {topic!r} does not exist. Outcomes are the only\n"
+                f"           record this service produces; if the broker does not create\n"
+                f"           topics on publish, every {topic.rsplit('.', 1)[-1]} outcome is lost.",
+                file=sys.stderr,
+            )
+
     wanted = settings.kafka_topic_requested
     if wanted in topics:
         partitions = len(metadata.topics[wanted].partitions)
@@ -327,11 +269,13 @@ def consume(settings: Settings, *, once: bool = False) -> int:
         group_id=settings.kafka_group_id,
         topics=(settings.kafka_topic_requested, *(t for t, _ in RETRY_TIERS)),
     )
-    loop = KafkaWorkerLoop(config, build_worker(settings))
+    publisher = build_publisher(settings)
+    loop = KafkaWorkerLoop(config, build_worker(settings, publisher=publisher))
 
     # SIGTERM must stop the loop rather than kill it. Mid-document, the pod is going away
     # in 30 seconds either way — but an uncommitted offset means a clean redelivery, and
-    # dying between the database write and the commit is the one window worth closing.
+    # dying between publishing the outcome and committing the offset is the one window
+    # worth closing.
     def stop(signum, _frame):
         log.info("stopping", extra={"signal": signum})
         loop.stop()
@@ -341,7 +285,14 @@ def consume(settings: Settings, *, once: bool = False) -> int:
 
     log.info("worker starting", extra=settings.describe())
     started = time.monotonic()
-    handled = loop.run(max_messages=1 if once else None)
+    try:
+        handled = loop.run(max_messages=1 if once else None)
+    finally:
+        # The producer holds background threads too, and an outcome left in its buffer is a
+        # document upstream never hears about.
+        closer = getattr(publisher, "close", None)
+        if closer is not None:
+            closer()
     log.info(
         "worker stopped",
         extra={"handled": handled, "seconds": round(time.monotonic() - started, 1)},

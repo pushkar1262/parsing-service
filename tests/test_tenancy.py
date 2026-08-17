@@ -1,14 +1,13 @@
-"""The upload event, and tenant isolation.
+"""The upload event, and where the tenant goes now that there is no database.
 
-Two things are being pinned here. First, that the backend's event schema maps onto a job
-correctly — a wrong `s3_key` join or a dropped `tenant_id` fails later in a way that looks
-like a storage problem. Second, that one tenant cannot read another's documents, tested
-through the API rather than asserted about a Postgres policy nobody can exercise without a
-database.
+The backend's event schema has to map onto a job exactly: a wrong `s3_key` join or a dropped
+`tenant_id` fails later in a way that looks like a storage problem.
 
-The Postgres policies in `002_tenancy.sql` are the real enforcement in production. These
-tests cover the layer above them, which is what keeps working if someone ever points
-`DATABASE_URL` at the table owner and silently disables every policy.
+Isolation itself is no longer testable here, and that is the point of the change rather than
+a gap in it. There is no store to scope, no row-level security to enforce and no tenant
+header to check — the tenant arrives on the event, travels through the job, and leaves on the
+outcome event, which is the only place it still exists once the offset is committed. What
+these tests pin is that it survives that journey; upstream owns enforcing it.
 """
 
 from __future__ import annotations
@@ -18,16 +17,15 @@ from pathlib import Path
 
 import pytest
 
-fastapi = pytest.importorskip("fastapi", reason="the API is an optional extra")
-pytest.importorskip("httpx", reason="TestClient needs httpx")
-
-from fastapi.testclient import TestClient
-
-from api.app import Services, create_app
 from store.artifacts import LocalArtifactStore
 from store.blobs import FetchPolicy, Storage
-from store.repository import InMemoryRepository
-from work.queue import InMemoryQueue, Job, MalformedEvent
+from work.queue import (
+    TOPIC_COMPLETED,
+    TOPIC_FAILED,
+    InMemoryQueue,
+    Job,
+    MalformedEvent,
+)
 from work.worker import Worker
 
 TENANT_A = "11111111-1111-1111-1111-111111111111"
@@ -121,152 +119,75 @@ def test_an_internal_retry_message_still_round_trips() -> None:
     assert Job.from_bytes(original.to_bytes()).reference == original.reference
 
 
+def test_force_and_parse_options_survive_the_event_mapping() -> None:
+    """Reprocessing is driven from upstream now, and it is driven by these two fields.
+
+    They used to be readable only from this service's own serialisation, so a reprocess
+    published as an upload event arrived looking identical to the original request. With
+    dedup keyed on whether the artifact already exists, that is a silent no-op rather than a
+    re-parse — the failure mode being that nothing at all appears to happen.
+    """
+    job = Job.from_event({**EVENT, "force": True, "parse_options": {"ocr": False}})
+    assert job.force is True
+    assert job.parse_options == {"ocr": False}
+
+
+def test_the_ordinary_event_is_not_a_forced_one() -> None:
+    job = Job.from_event(EVENT)
+    assert job.force is False
+    assert job.parse_options == {}
+
+
+def test_a_malformed_parse_options_is_ignored_rather_than_fatal() -> None:
+    """A producer bug here should not dead-letter a document that is otherwise fine."""
+    job = Job.from_event({**EVENT, "parse_options": "not a mapping"})
+    assert job.parse_options == {}
+
+
 # --------------------------------------------------------------------------- #
-# isolation
+# the tenant's journey: event → job → outcome event
 # --------------------------------------------------------------------------- #
 
 
 @pytest.fixture
-def api(tmp_path: Path):
+def env(tmp_path: Path):
     inbox = tmp_path / "inbox"
     inbox.mkdir()
     (inbox / "a.md").write_bytes(b"# Tenant A\n\nA must authenticate within 300ms.\n")
-    (inbox / "b.md").write_bytes(b"# Tenant B\n\nB must encrypt everything.\n")
-
-    repository = InMemoryRepository()
-    artifacts = LocalArtifactStore(tmp_path / "artifacts")
-    worker = Worker(
-        repository=repository,
-        storage=Storage(FetchPolicy(local_roots=(inbox,))),
-        artifacts=artifacts,
-        publisher=InMemoryQueue(),
-    )
-    for doc, tenant, name in (("doc-a", TENANT_A, "a.md"), ("doc-b", TENANT_B, "b.md")):
-        outcome = worker.process(
-            Job(
-                document_id=doc,
-                reference=str(inbox / name),
-                tenant_id=tenant,
-                project_id=PROJECT,
-            )
-        )
-        assert outcome.ok
-
-    app = create_app(Services(repository=repository, artifacts=artifacts))
-    return TestClient(app), repository
-
-
-def test_a_document_reports_its_tenant_and_project(api) -> None:
-    client, _ = api
-    body = client.get("/v1/documents/doc-a", headers={"X-Tenant-Id": TENANT_A}).json()
-    assert body["tenant_id"] == TENANT_A
-    assert body["project_id"] == PROJECT
-
-
-def test_one_tenant_cannot_read_anothers_document(api) -> None:
-    """404 rather than 403: telling a caller the document exists is itself a disclosure."""
-    client, _ = api
-    assert client.get("/v1/documents/doc-b", headers={"X-Tenant-Id": TENANT_A}).status_code == 404
-    assert client.get("/v1/documents/doc-a", headers={"X-Tenant-Id": TENANT_B}).status_code == 404
-
-
-def test_content_is_scoped_too_not_just_status(api) -> None:
-    """The status check being scoped is no use if the content endpoint is not."""
-    client, _ = api
-    assert (
-        client.get("/v1/documents/doc-b/content", headers={"X-Tenant-Id": TENANT_A}).status_code
-        == 404
-    )
-    assert (
-        client.get("/v1/documents/doc-b/text", headers={"X-Tenant-Id": TENANT_A}).status_code
-        == 404
-    )
-
-
-def test_locate_cannot_be_used_to_read_across_tenants(api) -> None:
-    """Otherwise quote lookup becomes an oracle for another tenant's content."""
-    client, _ = api
-    response = client.post(
-        "/v1/documents/doc-b/locate",
-        json={"quotes": ["must encrypt everything"]},
-        headers={"X-Tenant-Id": TENANT_A},
-    )
-    assert response.status_code == 404
-
-
-def test_batch_status_filters_rather_than_failing(api) -> None:
-    """A set containing another tenant's id returns only what the caller may see."""
-    client, _ = api
-    body = client.get(
-        "/v1/documents?ids=doc-a,doc-b", headers={"X-Tenant-Id": TENANT_A}
-    ).json()
-    assert [b["document_id"] for b in body] == ["doc-a"]
-
-
-def test_deleting_across_tenants_is_refused(api) -> None:
-    client, repository = api
-    assert (
-        client.delete("/v1/documents/doc-b", headers={"X-Tenant-Id": TENANT_A}).status_code
-        == 404
-    )
-    assert repository.get("doc-b").deleted_at is None
-
-
-def test_reprocess_across_tenants_is_refused(api) -> None:
-    client, _ = api
-    assert (
-        client.post(
-            "/v1/documents/doc-b/reprocess", headers={"X-Tenant-Id": TENANT_A}
-        ).status_code
-        == 404
-    )
-
-
-def test_a_reprocess_job_carries_the_documents_own_tenant(api) -> None:
-    """Taken from the row, never from the request, so it cannot be relabelled."""
-    client, repository = api
     queue = InMemoryQueue()
-    app = create_app(
-        Services(
-            repository=repository,
-            artifacts=LocalArtifactStore(Path("/tmp/unused")),
-            publisher=queue,
-        )
+    worker = Worker(
+        storage=Storage(FetchPolicy(local_roots=(inbox,))),
+        artifacts=LocalArtifactStore(tmp_path / "artifacts"),
+        publisher=queue,
     )
-    TestClient(app).post(
-        "/v1/documents/doc-a/reprocess", headers={"X-Tenant-Id": TENANT_A}
+    return worker, queue, inbox
+
+
+def test_the_tenant_reaches_the_completion_event_unchanged(env) -> None:
+    worker, queue, inbox = env
+    job = Job.from_event({**EVENT, "s3_key": "ignored"})
+    outcome = worker.process(
+        Job(**{**vars(job), "reference": str(inbox / "a.md")})
     )
-    from work.queue import TOPIC_REQUESTED
+    assert outcome.ok
 
-    job = queue.jobs_in(TOPIC_REQUESTED)[0]
-    assert job.tenant_id == TENANT_A
-    assert job.project_id == PROJECT
-
-
-def test_without_a_header_reads_are_unscoped_by_default(api) -> None:
-    """Which is what keeps a single-tenant deployment working."""
-    client, _ = api
-    assert client.get("/v1/documents/doc-a").status_code == 200
-    assert client.get("/v1/documents/doc-b").status_code == 200
+    event = queue.events_in(TOPIC_COMPLETED)[0]
+    assert event.tenant_id == TENANT_A
+    assert event.project_id == PROJECT
+    assert event.event_id == EVENT["event_id"]
 
 
-def test_a_deployment_can_require_the_tenant_header(api) -> None:
-    """For a genuinely multi-tenant deployment: fail rather than serve broadly."""
-    _, repository = api
-    app = create_app(
-        Services(repository=repository, artifacts=LocalArtifactStore(Path("/tmp/unused"))),
-        require_tenant=True,
+def test_the_tenant_reaches_the_failure_event_too(env) -> None:
+    """The case that matters more: a failure has no artifact, so this event is the only
+    record that anything happened to this document at all."""
+    worker, queue, _inbox = env
+    job = Job.from_event(EVENT)
+    outcome = worker.process(
+        Job(**{**vars(job), "reference": "/nonexistent/nowhere.txt"})
     )
-    client = TestClient(app)
-    assert client.get("/v1/documents/doc-a").status_code == 400
-    assert (
-        client.get("/v1/documents/doc-a", headers={"X-Tenant-Id": TENANT_A}).status_code
-        == 200
-    )
+    assert not outcome.ok
 
-
-def test_the_worker_records_tenancy_from_the_event(api) -> None:
-    _, repository = api
-    record = repository.get("doc-a")
-    assert record.tenant_id == TENANT_A
-    assert record.project_id == PROJECT
+    failure = queue.failures_in(TOPIC_FAILED)[0]
+    assert failure.tenant_id == TENANT_A
+    assert failure.project_id == PROJECT
+    assert failure.permanent is True

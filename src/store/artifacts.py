@@ -32,22 +32,43 @@ from domain.errors import ObjectNotFound, StorageUnavailable
 ARTIFACT_NAME = "document.json"
 
 
-def artifact_prefix(content_hash: str, parser_version: str) -> str:
-    return f"parsed/{content_hash}/{parser_version}"
+def artifact_prefix(
+    content_hash: str, parser_version: str, options_hash: str = ""
+) -> str:
+    """Where one parse of one set of bytes lives.
+
+    `options_hash` is appended only when non-empty, which keeps every key written before
+    options existed valid and unmoved. It has to be in the key at all because this is now
+    the idempotency check: two requests for the same bytes and parser version but different
+    `parse_options` produce different content, and without the third segment the second
+    would either be skipped as already-done or silently overwrite the first.
+    """
+    base = f"parsed/{content_hash}/{parser_version}"
+    return f"{base}/o-{options_hash}" if options_hash else base
 
 
-def artifact_key(content_hash: str, parser_version: str) -> str:
-    return f"{artifact_prefix(content_hash, parser_version)}/{ARTIFACT_NAME}"
+def artifact_key(
+    content_hash: str, parser_version: str, options_hash: str = ""
+) -> str:
+    prefix = artifact_prefix(content_hash, parser_version, options_hash)
+    return f"{prefix}/{ARTIFACT_NAME}"
 
 
-def page_image_key(content_hash: str, parser_version: str, page: int) -> str:
-    return f"{artifact_prefix(content_hash, parser_version)}/pages/{page}.png"
+def page_image_key(
+    content_hash: str, parser_version: str, page: int, options_hash: str = ""
+) -> str:
+    prefix = artifact_prefix(content_hash, parser_version, options_hash)
+    return f"{prefix}/pages/{page}.png"
 
 
 @runtime_checkable
 class ArtifactStore(Protocol):
     def put(
-        self, document: ParsedDocument, *, page_images: dict[int, bytes] | None = None
+        self,
+        document: ParsedDocument,
+        *,
+        page_images: dict[int, bytes] | None = None,
+        options_hash: str = "",
     ) -> str: ...
 
     def get(self, key: str) -> ParsedDocument: ...
@@ -75,7 +96,11 @@ class _BaseArtifactStore:
         raise NotImplementedError
 
     def put(
-        self, document: ParsedDocument, *, page_images: dict[int, bytes] | None = None
+        self,
+        document: ParsedDocument,
+        *,
+        page_images: dict[int, bytes] | None = None,
+        options_hash: str = "",
     ) -> str:
         version = document.metadata.parser_version
         images: dict[int, str] = {}
@@ -84,7 +109,7 @@ class _BaseArtifactStore:
         # not exist yet. A crash between the two leaves orphans, which is recoverable;
         # the other order leaves a served document with broken references, which is not.
         for number, payload in (page_images or {}).items():
-            key = page_image_key(document.content_hash, version, number)
+            key = page_image_key(document.content_hash, version, number, options_hash)
             self._write(key, payload)
             images[number] = key
 
@@ -93,7 +118,7 @@ class _BaseArtifactStore:
                 if page.number in images:
                     page.image_key = images[page.number]
 
-        key = artifact_key(document.content_hash, version)
+        key = artifact_key(document.content_hash, version, options_hash)
         self._write(key, document.model_dump_json().encode("utf-8"))
         return key
 

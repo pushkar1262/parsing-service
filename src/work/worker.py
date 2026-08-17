@@ -1,14 +1,28 @@
-"""The worker: fetch, parse, persist, and only then acknowledge.
+"""The worker: fetch, parse, store an artifact, announce the outcome.
 
-Everything here is arranged around one rule, and the rest follows from it:
+Stateless. There is no database and no memory between messages — the only durable results
+of processing a document are **an object in S3 and an event on Kafka**, and everything the
+service used to record in `documents` and `parse_runs` is now upstream's to own.
 
-    **The offset is committed last, after the database commit.**
+Three consequences shape this file:
 
-Crash before it and the message is redelivered — caught by the claim gate or the run's
-unique constraint, both of which answer "already done" without reparsing. Crash after it
-and the work is durable. Get the order backwards and a crash between the commit and the
-write silently drops a document: nothing errors, nothing retries, and the document sits in
-`pending` until somebody notices it was never processed.
+**The artifact key is the idempotency check.** A parse is a pure function of the raw bytes,
+the parser version and the parse options, and the key is built from exactly those three
+things — so "have we done this already?" is a `HeadObject`, not a row lookup. The conditional
+claim, the lease, and the unique constraint that used to answer it are gone with the table.
+
+**A duplicate still emits its event.** The old worker answered a replay from the database
+and stayed silent. Silence is no longer safe: an event is the only notification upstream
+gets, so a dropped message would leave a document pending forever with republishing unable
+to fix it — the second request would find the artifact present and say nothing at all. So a
+duplicate re-reads the existing artifact and emits the same completion event again. Costs one
+GET, makes replay a working recovery path, and upstream is required to be idempotent anyway.
+
+**Every terminal outcome is announced.** Success goes to `documents.parse.completed`,
+permanent failure and exhausted retries to `documents.parse.failed`. A transient failure
+mid-tiers announces nothing, because it is still being worked on. If neither event is ever
+published, the document is stuck — which is why upstream needs a staleness sweep and why
+`publisher=None` is a development-only configuration.
 
 `process` deliberately returns an `Outcome` rather than raising. A worker loop that has to
 catch exceptions to decide whether to commit an offset will eventually catch the wrong one
@@ -21,20 +35,23 @@ from __future__ import annotations
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
 
 from domain.document import ParsedDocument
 from domain.errors import ServiceError
-from domain.status import DocumentStatus, ParseRun
+from domain.status import DocumentStatus
 from parse.pipeline import parse_document_full
 from parse.registry import Registry, default_registry
-from store.artifacts import ArtifactStore
+from store.artifacts import ArtifactStore, artifact_key
 from store.blobs import Storage
-from store.repository import ClaimResult, DocumentRepository, DuplicateRun
 from work.queue import (
     TOPIC_COMPLETED,
     TOPIC_DLQ,
+    TOPIC_FAILED,
+    CompletionEvent,
+    FailureEvent,
     Job,
     Message,
     Publisher,
@@ -46,7 +63,7 @@ class Disposition(str, Enum):
     """What the loop should do with the message.
 
     `COMMIT` covers success *and* permanent failure, because both are final: the document
-    has its answer recorded and redelivering the message would only produce the same
+    has its answer announced and redelivering the message would only produce the same
     answer again.
     """
 
@@ -79,7 +96,6 @@ class Worker:
     def __init__(
         self,
         *,
-        repository: DocumentRepository,
         storage: Storage,
         artifacts: ArtifactStore,
         publisher: Publisher | None = None,
@@ -87,90 +103,42 @@ class Worker:
         parser_version: str = "1.0",
         resolve_reference: Callable[[str], str] | None = None,
         on_event: Callable[[str, dict[str, Any]], None] | None = None,
+        now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
     ) -> None:
-        self.repository = repository
         self.storage = storage
         self.artifacts = artifacts
         self.publisher = publisher
         self.registry = registry or default_registry()
-        # Stamped on every run and part of the idempotency key, so cutting a new version
-        # is what makes a backfill reparse rather than skip.
+        # Stamped on every artifact and part of the key, so cutting a new version is what
+        # makes a backfill reparse rather than skip.
         self.parser_version = parser_version
         # A queue message may carry a bare S3 key rather than a full URI, and `parse_ref`
         # would read that as a local filesystem path. Resolution happens here, once, so no
         # entrypoint has to remember to do it.
         self._resolve = resolve_reference or (lambda reference: reference)
         self._on_event = on_event or (lambda name, fields: None)
+        self._now = now
 
     # ------------------------------------------------------------------ main
 
     def process(self, job: Job) -> Outcome:
         reference = self._resolve(job.reference)
-        # Scope the connection before the first statement. On Postgres this sets
-        # `app.tenant_id`, which the row-level security policies match against; on the
-        # in-memory repository it does nothing, which is why the explicit tenant_id below
-        # is passed as well.
-        scope = getattr(self.repository, "use_tenant", None)
-        if scope is not None:
-            scope(job.tenant_id)
-
-        self.repository.register(
-            job.document_id,
-            source_uri=reference,
-            media_type=job.media_type,
-            tenant_id=job.tenant_id,
-            project_id=job.project_id,
-        )
-
-        claim = self.repository.claim(job.document_id)
-        if not claim.claimed:
-            return self._already_handled(job, claim)
 
         try:
             fetched = self.storage.fetch(reference)
         except ServiceError as exc:
-            return self._failed(job, None, exc)
+            # Before any parse: no run id and no content hash, because there are no bytes.
+            return self._failed(job, exc, run_id=None, content_hash=None)
 
         options_hash = _options_hash(job.parse_options)
-        existing = self.repository.find_run(
-            job.document_id, fetched.content_hash, self.parser_version, options_hash
-        )
-        if existing is not None and not job.force:
-            # A replay of work already done. Answering from the database rather than
-            # reparsing is what makes at-least-once delivery cheap instead of merely
-            # correct.
-            self._emit("job.duplicate", job, run_id=existing.id)
-            return Outcome(
-                Disposition.COMMIT,
-                job.document_id,
-                run_id=existing.id,
-                skipped=True,
-                detail="a run already exists for these bytes and parser version",
-            )
+        key = artifact_key(fetched.content_hash, self.parser_version, options_hash)
 
-        try:
-            run = self.repository.start_run(
-                ParseRun(
-                    id=str(uuid.uuid4()),
-                    document_id=job.document_id,
-                    content_hash=fetched.content_hash,
-                    parser_version=self.parser_version,
-                    parse_options_hash=options_hash,
-                    attempt=job.attempt,
-                    trace_id=job.trace_id,
-                )
-            )
-        except DuplicateRun as duplicate:
-            # Lost the race to a concurrent delivery. Not an error: the other worker owns
-            # this one, and committing lets it get on with it.
-            return Outcome(
-                Disposition.COMMIT,
-                job.document_id,
-                run_id=duplicate.existing.id,
-                skipped=True,
-                detail="another worker started this run first",
-            )
+        if not job.force:
+            duplicate = self._duplicate(job, key)
+            if duplicate is not None:
+                return duplicate
 
+        run_id = str(uuid.uuid4())
         try:
             output = parse_document_full(
                 fetched.data,
@@ -182,119 +150,171 @@ class Worker:
                 filename=job.filename or _filename_of(job, fetched),
                 source=fetched.source,
                 registry=self.registry,
+                # Must match the version in `key` above, or the dedup check and the write
+                # address two different objects.
+                parser_version=self.parser_version,
             )
         except ServiceError as exc:
-            return self._failed(job, run.id, exc)
+            return self._failed(
+                job, exc, run_id=run_id, content_hash=fetched.content_hash
+            )
         except Exception as exc:  # noqa: BLE001 - an unexpected parser bug
             # Transient by default: an unclassified crash is more likely a bug we will
             # fix than a property of the document, and a retry costs less than a document
             # dead-lettered for a reason nobody wrote down.
-            return self._failed(job, run.id, _Unclassified(str(exc)))
+            return self._failed(
+                job,
+                _Unclassified(str(exc)),
+                run_id=run_id,
+                content_hash=fetched.content_hash,
+            )
 
-        return self._succeeded(job, run, output.document, output.page_images)
+        return self._succeeded(
+            job, run_id, output.document, output.page_images, options_hash
+        )
 
     # ------------------------------------------------------------- outcomes
 
     def _succeeded(
         self,
         job: Job,
-        run: ParseRun,
+        run_id: str,
         document: ParsedDocument,
         page_images: dict[int, bytes],
+        options_hash: str,
     ) -> Outcome:
-        key = self.artifacts.put(document, page_images=page_images)
-
-        # Database last, after the artifact exists. A row pointing at an object that was
-        # never written is a 500 on the content API; an object with no row is an orphan a
-        # sweeper cleans up.
-        record = self.repository.complete_run(
-            run.id,
-            artifact_key=key,
-            content_hash=document.content_hash,
-            metadata=document.metadata.model_dump(mode="json"),
+        # The artifact before the announcement, always. An event naming an object that was
+        # never written is a 404 for every consumer that reacts to it; an object nobody was
+        # told about is invisible, which a replay fixes.
+        key = self.artifacts.put(
+            document, page_images=page_images, options_hash=options_hash
         )
 
-        metrics = {
-            "format": document.metadata.format,
-            "chars": document.metadata.char_count,
-            "blocks": document.metadata.block_count,
-            "pages": document.metadata.page_count,
-            "ocr_pages": document.metadata.ocr_page_count,
-            # The silent-failure detector: a PDF with a broken font map extracts three
-            # characters per page and reports complete success.
-            "chars_per_page": (
-                document.metadata.char_count / document.metadata.page_count
-                if document.metadata.page_count
-                else None
-            ),
-            "warnings": [w.code for w in document.warnings],
-        }
-        self._emit("job.succeeded", job, run_id=run.id, **metrics)
-
-        if self.publisher is not None:
-            self.publisher.publish(
-                Message(
-                    topic=TOPIC_COMPLETED,
-                    key=job.document_id,
-                    value=Job(
-                        document_id=job.document_id,
-                        reference=job.reference,
-                        trace_id=job.trace_id,
-                    ).to_bytes(),
-                )
-            )
+        metrics = _metrics(document)
+        self._emit("job.succeeded", job, run_id=run_id, **metrics)
+        self._announce_success(job, run_id, document, key, duplicate=False)
 
         return Outcome(
             Disposition.COMMIT,
             job.document_id,
-            run_id=run.id,
-            status=record.status,
+            run_id=run_id,
+            status=DocumentStatus.READY,
             artifact_key=key,
             metrics=metrics,
         )
 
-    def _failed(self, job: Job, run_id: str | None, exc: ServiceError) -> Outcome:
-        if run_id is not None:
-            record = self.repository.fail_run(
-                run_id,
-                failure_class=exc.failure_class,
-                failure_reason=str(exc),
-                permanent=not exc.transient,
-            )
-        else:
-            record = self._fail_document(job.document_id, exc)
+    def _duplicate(self, job: Job, key: str) -> Outcome | None:
+        """These bytes are already parsed at this version. Re-announce and skip.
 
+        Returns None when there is nothing to reuse, so the caller parses normally. That
+        covers the object being absent and the object being unreadable — a truncated or
+        half-written artifact should be replaced by a real parse, not served forever
+        because a `HeadObject` said something was there.
+        """
+        try:
+            if not self.artifacts.exists(key):
+                return None
+            document = self.artifacts.get(key)
+        except (ServiceError, ValueError):
+            # ValueError covers a pydantic ValidationError: the object is there but is not
+            # a document, which is a half-written or truncated write. Parse it again rather
+            # than serving the corruption forever on the strength of a `HeadObject`.
+            return None
+
+        run_id = str(uuid.uuid4())
+        metrics = _metrics(document)
+        self._emit("job.duplicate", job, run_id=run_id, artifact_key=key, **metrics)
+        self._announce_success(job, run_id, document, key, duplicate=True)
+
+        return Outcome(
+            Disposition.COMMIT,
+            job.document_id,
+            run_id=run_id,
+            status=DocumentStatus.READY,
+            artifact_key=key,
+            skipped=True,
+            detail="an artifact already exists for these bytes and parser version",
+            metrics=metrics,
+        )
+
+    def _announce_success(
+        self,
+        job: Job,
+        run_id: str,
+        document: ParsedDocument,
+        key: str,
+        *,
+        duplicate: bool,
+    ) -> None:
+        if self.publisher is None:
+            return
+        self.publisher.publish(
+            Message(
+                topic=TOPIC_COMPLETED,
+                key=job.document_id,
+                value=CompletionEvent(
+                    document_id=job.document_id,
+                    reference=job.reference,
+                    run_id=run_id,
+                    content_hash=document.content_hash,
+                    artifact_key=key,
+                    status=DocumentStatus.READY.value,
+                    # Carried from the job, not looked up: this is the tenant the work was
+                    # actually scoped to, and it is the only copy of it that survives.
+                    tenant_id=job.tenant_id,
+                    project_id=job.project_id,
+                    metadata=document.metadata.model_dump(mode="json"),
+                    warnings=[w.code for w in document.warnings],
+                    duplicate=duplicate,
+                    completed_at=self._now().isoformat(),
+                    event_id=job.event_id,
+                    trace_id=job.trace_id,
+                ).to_bytes(),
+                headers=self._headers(job),
+            )
+        )
+
+    def _failed(
+        self,
+        job: Job,
+        exc: ServiceError,
+        *,
+        run_id: str | None,
+        content_hash: str | None,
+    ) -> Outcome:
         if not exc.transient:
-            self._emit(
-                "job.failed_permanently", job, failure_class=exc.failure_class
+            self._emit("job.failed_permanently", job, failure_class=exc.failure_class)
+            self._announce_failure(
+                job, exc, run_id=run_id, content_hash=content_hash, permanent=True
             )
             self._to_dead_letter(job, exc)
             return Outcome(
                 Disposition.DEAD_LETTER,
                 job.document_id,
                 run_id=run_id,
-                status=record.status if record else None,
+                status=DocumentStatus.FAILED,
                 failure_class=exc.failure_class,
                 failure_reason=str(exc),
             )
 
         destination = next_destination(job)
         if destination is None:
+            # Out of tiers. Terminal in practice, so it is announced — but as a transient
+            # failure that ran out of attempts, which is a different thing from a fact
+            # about the document and often worth replaying after an infrastructure fix.
             self._emit("job.retries_exhausted", job, failure_class=exc.failure_class)
+            self._announce_failure(
+                job, exc, run_id=run_id, content_hash=content_hash, permanent=False
+            )
             self._to_dead_letter(job, exc, exhausted=True)
-            if run_id is not None:
-                self.repository.fail_run(
-                    run_id,
-                    failure_class="transient_exhausted",
-                    failure_reason=str(exc),
-                    permanent=True,
-                )
             return Outcome(
                 Disposition.DEAD_LETTER,
                 job.document_id,
                 run_id=run_id,
-                failure_class="transient_exhausted",
+                status=DocumentStatus.FAILED,
+                failure_class=exc.failure_class,
                 failure_reason=str(exc),
+                detail="retries exhausted",
             )
 
         topic, retry = destination
@@ -307,6 +327,8 @@ class Worker:
                     headers={"not_before": retry.not_before.isoformat()},
                 )
             )
+        # Nothing announced: this document is still being worked on, and telling upstream
+        # it failed would show a user a failure that fixes itself ninety seconds later.
         self._emit("job.retrying", job, failure_class=exc.failure_class, topic=topic)
         return Outcome(
             Disposition.RETRY,
@@ -315,6 +337,47 @@ class Worker:
             failure_class=exc.failure_class,
             failure_reason=str(exc),
             detail=topic,
+        )
+
+    def _announce_failure(
+        self,
+        job: Job,
+        exc: ServiceError,
+        *,
+        run_id: str | None,
+        content_hash: str | None,
+        permanent: bool,
+    ) -> None:
+        if self.publisher is None:
+            return
+        self.publisher.publish(
+            Message(
+                topic=TOPIC_FAILED,
+                key=job.document_id,
+                value=FailureEvent(
+                    document_id=job.document_id,
+                    reference=job.reference,
+                    status=DocumentStatus.FAILED.value,
+                    # The original class, not "transient_exhausted": *what* broke is the
+                    # useful half, and `permanent` already says whether it can recur.
+                    failure_class=exc.failure_class,
+                    failure_reason=str(exc),
+                    permanent=permanent,
+                    attempt=job.attempt,
+                    tenant_id=job.tenant_id,
+                    project_id=job.project_id,
+                    run_id=run_id,
+                    content_hash=content_hash,
+                    failed_at=self._now().isoformat(),
+                    event_id=job.event_id,
+                    trace_id=job.trace_id,
+                ).to_bytes(),
+                headers={
+                    **self._headers(job),
+                    "failure_class": exc.failure_class,
+                    "permanent": "true" if permanent else "false",
+                },
+            )
         )
 
     def _to_dead_letter(
@@ -328,8 +391,8 @@ class Worker:
                 key=job.document_id,
                 value=job.to_bytes(),
                 headers={
-                    # Everything needed to replay after a fix, without going back to the
-                    # database to work out what happened.
+                    # Everything needed to replay after a fix, in the headers so it can be
+                    # read without deserialising a payload that may be the broken part.
                     "failure_class": (
                         "transient_exhausted" if exhausted else exc.failure_class
                     ),
@@ -340,39 +403,17 @@ class Worker:
             )
         )
 
-    def _already_handled(self, job: Job, claim: ClaimResult) -> Outcome:
-        """A claim that failed is usually good news, and never a reason to retry.
-
-        Already `ready`, already `processing`, or deleted: in every case reparsing would
-        be wrong, so the message is committed and the reason recorded.
-        """
-        self._emit("job.not_claimed", job, reason=claim.reason)
-        return Outcome(
-            Disposition.COMMIT,
-            job.document_id,
-            status=claim.document.status if claim.document else None,
-            skipped=True,
-            detail=claim.reason,
-        )
-
-    def _fail_document(self, document_id: str, exc: ServiceError):
-        record = self.repository.get(document_id)
-        if record is None:
-            return None
-        run = self.repository.start_run(
-            ParseRun(
-                id=str(uuid.uuid4()),
-                document_id=document_id,
-                content_hash=f"unfetched:{document_id}",
-                parser_version=self.parser_version,
+    def _headers(self, job: Job) -> dict[str, str]:
+        """Correlation context, so a consumer can route or filter without deserialising."""
+        return {
+            k: v
+            for k, v in (
+                ("document_id", job.document_id),
+                ("tenant_id", job.tenant_id),
+                ("trace_id", job.trace_id),
             )
-        )
-        return self.repository.fail_run(
-            run.id,
-            failure_class=exc.failure_class,
-            failure_reason=str(exc),
-            permanent=not exc.transient,
-        )
+            if v
+        }
 
     def _emit(self, event: str, job: Job, **fields: Any) -> None:
         self._on_event(
@@ -394,10 +435,27 @@ class _Unclassified(ServiceError):
     failure_class = "internal"
 
 
-def _options_hash(options: dict[str, Any]) -> str:
-    """A stable fingerprint of the parse options, for the idempotency key.
+def _metrics(document: ParsedDocument) -> dict[str, Any]:
+    metadata = document.metadata
+    return {
+        "format": metadata.format,
+        "chars": metadata.char_count,
+        "blocks": metadata.block_count,
+        "pages": metadata.page_count,
+        "ocr_pages": metadata.ocr_page_count,
+        # The silent-failure detector: a PDF with a broken font map extracts three
+        # characters per page and reports complete success.
+        "chars_per_page": (
+            metadata.char_count / metadata.page_count if metadata.page_count else None
+        ),
+        "warnings": [w.code for w in document.warnings],
+    }
 
-    Sorted, so `{"a":1,"b":2}` and `{"b":2,"a":1}` are the same run rather than two.
+
+def _options_hash(options: dict[str, Any]) -> str:
+    """A stable fingerprint of the parse options, for the artifact key.
+
+    Sorted, so `{"a":1,"b":2}` and `{"b":2,"a":1}` are the same parse rather than two.
     """
     if not options:
         return ""

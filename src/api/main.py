@@ -3,8 +3,11 @@
     uvicorn api.main:app --app-dir src --port 8000
 
 Built from the same `Settings` the worker uses, so the two cannot disagree about which
-bucket holds the artifacts — a mismatch there produces a 500 on every content request with
-a perfectly healthy database behind it.
+bucket holds the artifacts — a mismatch there produces a 404 on every content request while
+every parse reports success.
+
+This app must not be exposed publicly: it addresses content by hash and has no store to
+check a caller's entitlement against. See the `api.app` module docstring.
 
 `presign` is wired in when S3 is configured, so `/pages/{n}/image` redirects rather than
 streaming megabytes of PNG through this process. The URL is short-lived: a page image is
@@ -17,7 +20,7 @@ import logging
 
 from api.app import Services, create_app
 from config import Settings
-from work.main import build_publisher, build_repository, configure_logging
+from work.main import configure_logging
 
 log = logging.getLogger("parsing.api")
 
@@ -42,9 +45,7 @@ def build_services(settings: Settings | None = None) -> Services:
         )
 
     return Services(
-        repository=build_repository(settings),
         artifacts=settings.artifact_store(s3_client=s3),
-        publisher=build_publisher(settings),
         parser_version=settings.parser_version,
         presign=presign,
     )
@@ -54,9 +55,7 @@ def build_app():
     configure_logging()
     settings = Settings.from_env()
     log.info("api starting", extra=settings.describe())
-    return create_app(
-        build_services(settings), require_tenant=settings.require_tenant_header
-    )
+    return create_app(build_services(settings))
 
 
 app = build_app()

@@ -97,16 +97,10 @@ class Settings:
     local_roots: tuple[Path, ...] = ()
 
     # ---- infrastructure
-    database_url: str = ""
-    # Migrations need CREATE, which the app role deliberately lacks. Kept separate so the
-    # service never runs holding privileges it only needs at deploy time — and so that
-    # pointing the app at the table owner, which silently disables every RLS policy, has to
-    # be a deliberate act rather than a convenient one.
-    database_migrate_url: str = ""
+    # No database: outcomes are published, not stored. See `work.worker`.
     kafka_bootstrap_servers: str = ""
     kafka_group_id: str = "parsing-service"
     kafka_topic_requested: str = "documents.parse.requested"
-    require_tenant_header: bool = False
 
     # ---- parsing
     parser_version: str = "1.0"
@@ -140,14 +134,11 @@ class Settings:
             allow_private_networks=_flag("ALLOW_PRIVATE_NETWORKS", False),
             allowed_host_suffixes=_csv("ALLOWED_HOST_SUFFIXES"),
             local_roots=tuple(Path(p) for p in _csv("LOCAL_ROOTS")),
-            database_url=os.environ.get("DATABASE_URL", "").strip(),
-            database_migrate_url=os.environ.get("DATABASE_MIGRATE_URL", "").strip(),
             kafka_bootstrap_servers=os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "").strip(),
             kafka_group_id=os.environ.get("KAFKA_GROUP_ID", "parsing-service").strip(),
             kafka_topic_requested=os.environ.get(
                 "KAFKA_TOPIC_REQUESTED", "documents.parse.requested"
             ).strip(),
-            require_tenant_header=_flag("REQUIRE_TENANT_HEADER", False),
             parser_version=os.environ.get("PARSER_VERSION", "1.0").strip(),
             extract_tables=_flag("EXTRACT_TABLES", True),
             ocr_enabled=_flag("OCR_ENABLED", True),
@@ -286,13 +277,9 @@ class Settings:
             "aws_credentials": "static" if self.has_static_credentials else "iam-chain",
             "access_key_id": _mask(self.aws_access_key_id),
             "secret_access_key": "***" if self.aws_secret_access_key else None,
-            "database": _redact_url(self.database_url),
-            "database_migrate": _redact_url(self.database_migrate_url),
-            "database_role": _role_of(self.database_url),
             "kafka_bootstrap_servers": self.kafka_bootstrap_servers or None,
             "kafka_group_id": self.kafka_group_id,
             "kafka_topic_requested": self.kafka_topic_requested,
-            "require_tenant_header": self.require_tenant_header,
             "parser_version": self.parser_version,
             "max_fetch_bytes": self.max_fetch_bytes,
             "allow_private_networks": self.allow_private_networks,
@@ -316,42 +303,3 @@ def _mask(value: str) -> str | None:
     if not value:
         return None
     return f"{value[:4]}…{value[-4:]}" if len(value) > 8 else "***"
-
-
-def _role_of(url: str) -> str | None:
-    """The role the service connects as, surfaced because it decides whether RLS applies.
-
-    Reported on startup so `postgres` in this field is visible immediately rather than
-    discovered when one tenant sees another's documents.
-    """
-    if not url or "://" not in url:
-        return None
-    _, _, rest = url.partition("://")
-    credentials, _, _host = rest.rpartition("@")
-    if not credentials:
-        return None
-    return credentials.split(":", 1)[0] or None
-
-
-def _host_of(url: str) -> str:
-    """host:port from a connection URL, for an error message that names the target."""
-    if "://" not in url:
-        return url or "an unspecified host"
-    _, _, rest = url.partition("://")
-    _, _, host = rest.rpartition("@")
-    return host.split("/", 1)[0] or "an unspecified host"
-
-
-def _redact_url(url: str) -> str | None:
-    """A database URL carries a password in the middle of it.
-
-    Logged as-is on startup — which is a very normal thing to do — it puts the database
-    password in the log aggregator.
-    """
-    if not url:
-        return None
-    if "@" not in url:
-        return url
-    scheme, _, rest = url.partition("://")
-    _credentials, _, host = rest.rpartition("@")
-    return f"{scheme}://***@{host}" if scheme else f"***@{host}"

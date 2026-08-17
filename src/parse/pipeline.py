@@ -63,6 +63,7 @@ def parse_document(
     content_hash: str | None = None,
     source: SourceRef | None = None,
     registry: Registry | None = None,
+    parser_version: str | None = None,
     _collect_images: dict[int, bytes] | None = None,
 ) -> ParsedDocument:
     """Parse `data` into the canonical representation.
@@ -70,6 +71,13 @@ def parse_document(
     `media_type` is optional and, when given, treated as a *hint that is checked*:
     we sniff regardless and use what the bytes say. Trusting a caller-supplied type
     is how a .exe gets handed to the PDF parser.
+
+    `parser_version` overrides the individual parser's own version, and the worker always
+    passes it. It has to win, because that string is a segment of the artifact key: if the
+    recorded version and the key's version can differ, the worker checks one key for
+    "already done" and writes to another, so nothing ever deduplicates and every redelivery
+    reparses. Left unset it falls back to the parser's version, which keeps
+    `examples/parse_file.py` and the format tests reporting what actually parsed.
     """
     registry = registry or default_registry()
     sniffed = detect(data, filename=filename)
@@ -94,7 +102,7 @@ def parse_document(
         document_id=document_id,
         fallback_format=sniffed,
         parser_name=parser.name,
-        parser_version=parser.version,
+        parser_version=parser_version or parser.version,
         content_hash=digest,
         source=source,
     )
