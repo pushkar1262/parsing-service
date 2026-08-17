@@ -30,8 +30,8 @@ python examples/parse_file.py "https://...presigned-url..."    # via plain HTTP
 | Plain text / Markdown · DOCX · **PDF** · **XLSX** · **HTML** · **CSV** | ✅ |
 | Quote lookup (`domain/locate.py`) | ✅ |
 | **Fetch from S3, presigned URLs, local — with SSRF guards and size caps** | ✅ |
+| PDF table extraction (ruled tables, de-duplicated from the text flow) | ✅ |
 | OCR backend (pages are detected and flagged; text not yet extracted) | ⬜ |
-| PDF table extraction | ⬜ |
 | Postgres + S3 persistence, status machine | ⬜ |
 | Kafka intake, retry tiers, DLQ | ⬜ |
 | HTTP API | ⬜ |
@@ -173,6 +173,17 @@ A page is flagged for OCR only when it has thin text **and** contains an image. 
 alone is a section divider or a short page, and flagging it would both cry wolf and route
 a readable page into the OCR lane at 10-100x the cost. A page with neither text nor images
 is reported as `blank_page`, because a broken export and a scan need different responses.
+
+Ruled tables are extracted with pdfplumber and **their lines are removed from the text
+flow**. That removal is the whole difficulty: pdfium's text layer contains the cell text
+too, so keeping both emits every cell twice — once structured, once as stray paragraphs.
+The two libraries disagree on coordinates (pdfplumber measures from the top of the page,
+pdfium from the bottom), so the table's box is converted before deciding which lines it
+covers, and the table is then re-inserted at its own vertical position rather than
+appended — a requirements table detached from its heading has lost what made it mean
+anything. Only ruled tables are detected; whitespace-aligned columns are ambiguous, and a
+wrongly-detected table swallows prose into cells. `PdfParser(extract_tables=False)` turns
+the second pass off.
 
 ## Conventions
 

@@ -51,7 +51,7 @@ from typing import Any
 import pypdfium2 as pdfium
 import pypdfium2.raw as pdfium_raw
 
-from domain.document import BlockType, PageSource
+from domain.document import BlockType, PageSource, TableData
 from parse.base import CorruptDocument, EncryptedDocument, PageInfo, ParseResult, RawBlock
 from parse.normalise import clean_inline, join_wrapped, normalise
 
@@ -110,17 +110,50 @@ class _Line:
     text: str
     size: float
     indent: float
+    right: float
     top: float
     bottom: float
     page: int
 
 
 @dataclass
+class _TableRegion:
+    """A ruled table, and the area of the page it occupies.
+
+    The geometry is not bookkeeping — it is what lets the lines that make up the table
+    be removed from the text flow. Without it the table's contents appear twice: once as
+    a table, once as a run of stray paragraphs.
+    """
+
+    rows: list[list[str]]
+    top: float
+    bottom: float
+    left: float
+    right: float
+    page: int
+
+    def contains(self, line: _Line) -> bool:
+        centre = (line.top + line.bottom) / 2
+        vertical = self.bottom - 1 <= centre <= self.top + 1
+        horizontal = line.right >= self.left - 2 and line.indent <= self.right + 2
+        return vertical and horizontal
+
+
+_Element = _Line | _TableRegion
+
+
+@dataclass
 class _Extraction:
-    lines: list[_Line] = field(default_factory=list)
+    # Lines and tables interleaved in reading order, so a table stays with the heading
+    # that introduces it rather than being appended after the prose.
+    elements: list[_Element] = field(default_factory=list)
     page_meta: dict[int, PageInfo] = field(default_factory=dict)
     ocr_candidates: list[int] = field(default_factory=list)
     page_count: int = 0
+
+    @property
+    def lines(self) -> list[_Line]:
+        return [item for item in self.elements if isinstance(item, _Line)]
 
 
 class PdfParser:
@@ -128,11 +161,18 @@ class PdfParser:
     version = "1.0"
     media_types = ("application/pdf",)
 
+    def __init__(self, *, extract_tables: bool = True) -> None:
+        # Table extraction is a second pass over the file with a different library and it
+        # is the slow part of parsing a large PDF. On by default because a requirements
+        # table read as loose lines is a silent loss of exactly the content that matters
+        # most; off for a deployment that has measured the cost and decided against it.
+        self.extract_tables = extract_tables
+
     def parse(self, data: bytes, *, filename: str | None = None) -> ParseResult:
         result = ParseResult()
         document = self._open(data)
         try:
-            extraction = self._extract(document, result)
+            extraction = self._extract(document, result, data)
             metadata = self._document_metadata(document)
         finally:
             document.close()
@@ -183,10 +223,12 @@ class PdfParser:
 
     # --------------------------------------------------------------- extraction
 
-    def _extract(self, document: Any, result: ParseResult) -> _Extraction:
+    def _extract(self, document: Any, result: ParseResult, data: bytes) -> _Extraction:
         extraction = _Extraction(page_count=len(document))
         if extraction.page_count == 0:
             raise CorruptDocument("the PDF contains no pages")
+
+        tables = self._tables(data, result) if self.extract_tables else {}
 
         for index in range(extraction.page_count):
             number = index + 1
@@ -226,11 +268,110 @@ class PdfParser:
                 # Genuinely blank. Worth recording because a run of blank pages usually
                 # means a broken export rather than an intentionally empty document.
                 result.warn("blank_page", f"page {number} contains nothing", page=number)
-            extraction.lines.extend(lines)
+
+            extraction.elements.extend(self._merge(lines, tables.get(number, [])))
 
         if extraction.ocr_candidates:
             result.metadata["ocr_candidate_pages"] = extraction.ocr_candidates
         return extraction
+
+    def _merge(
+        self, lines: list[_Line], tables: list[_TableRegion]
+    ) -> list[_Element]:
+        """Drop the lines a table is made of, then interleave by position.
+
+        Both halves matter. Keeping the lines would emit every cell twice — once inside
+        the table, once as loose paragraphs — and appending tables at the end of the page
+        would detach a requirements table from the heading that gives it meaning.
+        Ordering by descending vertical position puts everything back in reading order.
+        """
+        if not tables:
+            return list(lines)
+
+        kept: list[_Element] = [
+            line for line in lines if not any(table.contains(line) for table in tables)
+        ]
+        kept.extend(tables)
+        kept.sort(key=lambda item: -item.top)
+        return kept
+
+    def _tables(
+        self, data: bytes, result: ParseResult
+    ) -> dict[int, list[_TableRegion]]:
+        """Ruled tables per page, via pdfplumber.
+
+        Only *ruled* tables are detected, which is pdfplumber's default and the
+        conservative choice: whitespace-aligned columns are genuinely ambiguous, and a
+        wrongly-detected table swallows surrounding prose into cells where a planning
+        step can no longer read it as sentences.
+
+        This is a second pass over the file and it is the slow part of parsing a large
+        PDF, which is why it is a flag rather than unconditional.
+        """
+        try:
+            import pdfplumber
+        except ImportError:  # pragma: no cover - environment dependent
+            result.warn(
+                "tables_not_extracted",
+                "pdfplumber is not installed, so any tables in this document were read "
+                "as loose lines; install parsing-service[pdf]",
+            )
+            return {}
+
+        import io
+
+        found: dict[int, list[_TableRegion]] = {}
+        try:
+            with pdfplumber.open(io.BytesIO(data)) as pdf:
+                for index, page in enumerate(pdf.pages):
+                    number = index + 1
+                    try:
+                        regions = self._page_tables(page, number)
+                    except Exception as exc:  # noqa: BLE001 - one bad page, not a bad document
+                        result.warn(
+                            "table_extraction_failed",
+                            f"page {number}: {exc}; its tables were read as loose lines",
+                            page=number,
+                        )
+                        continue
+                    finally:
+                        page.flush_cache()
+                    if regions:
+                        found[number] = regions
+        except Exception as exc:  # noqa: BLE001 - text extraction already succeeded
+            # Never fail the document over tables: the text layer is the primary output
+            # and losing structure is much better than losing the content entirely.
+            result.warn(
+                "table_extraction_failed",
+                f"table extraction failed for the whole document ({exc}); tables were "
+                f"read as loose lines",
+            )
+            return {}
+        return found
+
+    def _page_tables(self, page: Any, number: int) -> list[_TableRegion]:
+        height = page.height
+        regions: list[_TableRegion] = []
+        for table in page.find_tables():
+            rows = [
+                [clean_inline(cell or "") for cell in row] for row in table.extract()
+            ]
+            rows = [row for row in rows if any(row)]
+            if not rows:
+                continue
+            left, top, right, bottom = table.bbox
+            # pdfplumber measures from the top of the page, pdfium from the bottom.
+            regions.append(
+                _TableRegion(
+                    rows=rows,
+                    top=height - top,
+                    bottom=height - bottom,
+                    left=left,
+                    right=right,
+                    page=number,
+                )
+            )
+        return regions
 
     def _has_images(self, page: Any) -> bool:
         """Whether anything is drawn on the page besides text.
@@ -265,22 +406,23 @@ class PdfParser:
             return []
 
         lines: list[_Line] = []
-        # char, left, bottom, top, font_size
-        current: list[tuple[str, float, float, float, float]] = []
+        # char, left, bottom, right, top, font_size
+        current: list[tuple[str, float, float, float, float, float]] = []
 
         def flush() -> None:
             if not current:
                 return
-            text = "".join(char for char, _, _, _, _ in current).strip()
+            text = "".join(char for char, _, _, _, _, _ in current).strip()
             if text:
-                sizes = [size for _, _, _, _, size in current if size > 0]
+                sizes = [size for _, _, _, _, _, size in current if size > 0]
                 lines.append(
                     _Line(
                         text=text,
                         size=statistics.median(sizes) if sizes else 0.0,
-                        indent=min(left for _, left, _, _, _ in current),
-                        top=max(top for _, _, _, top, _ in current),
-                        bottom=min(bottom for _, _, bottom, _, _ in current),
+                        indent=min(left for _, left, _, _, _, _ in current),
+                        right=max(right for _, _, _, right, _, _ in current),
+                        top=max(top for _, _, _, _, top, _ in current),
+                        bottom=min(bottom for _, _, bottom, _, _, _ in current),
                         page=number,
                     )
                 )
@@ -295,10 +437,12 @@ class PdfParser:
                 flush()
                 continue
             try:
-                left, bottom, _right, top = textpage.get_charbox(position)
+                left, bottom, right, top = textpage.get_charbox(position)
             except (pdfium.PdfiumError, TypeError, IndexError):
                 continue
-            current.append((char, left, bottom, top, _font_size(textpage, position)))
+            current.append(
+                (char, left, bottom, right, top, _font_size(textpage, position))
+            )
         flush()
         return lines
 
@@ -339,7 +483,22 @@ class PdfParser:
             paragraph.clear()
 
         previous: _Line | None = None
-        for line in lines:
+        for element in extraction.elements:
+            if isinstance(element, _TableRegion):
+                # A table ends whatever paragraph preceded it, and attaches to the open
+                # heading like any other block.
+                flush()
+                sink().append(
+                    RawBlock(
+                        type=BlockType.TABLE,
+                        table=TableData(rows=element.rows, header_rows=1),
+                        page=element.page,
+                    )
+                )
+                previous = None
+                continue
+
+            line = element
             if previous is not None and self._breaks_paragraph(
                 previous, line, gap_threshold
             ):

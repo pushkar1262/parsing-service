@@ -328,6 +328,124 @@ def test_a_genuinely_blank_page_is_reported_as_blank_not_as_a_scan() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# tables — the content most worth not losing
+# --------------------------------------------------------------------------- #
+
+
+def build_pdf_with_table() -> bytes:
+    """A ruled table between two paragraphs, which is how requirement tables appear."""
+    import io
+
+    rows = [
+        ["Document", "Required", "Retention"],
+        ["Government ID", "Yes", "7 years"],
+        ["Proof of address", "Yes", "7 years"],
+    ]
+    buffer = io.BytesIO()
+    pdf = canvas.Canvas(buffer, pagesize=PAGE)
+    pdf.setFont("Helvetica", 16)
+    pdf.drawString(72, 780, "Document Requirements")
+    pdf.setFont("Helvetica", 10)
+    pdf.drawString(72, 750, "The table below lists the documents a merchant must supply.")
+
+    x0, y0, width, height = 72, 640, 150, 20
+    for row_index, row in enumerate(rows):
+        for col_index, cell in enumerate(row):
+            pdf.drawString(
+                x0 + col_index * width + 4,
+                y0 + (len(rows) - 1 - row_index) * height + 6,
+                cell,
+            )
+    for i in range(len(rows) + 1):
+        pdf.line(x0, y0 + i * height, x0 + 3 * width, y0 + i * height)
+    for j in range(4):
+        pdf.line(x0 + j * width, y0, x0 + j * width, y0 + len(rows) * height)
+
+    pdf.drawString(72, 600, "Retention is measured from the date of account closure.")
+    pdf.showPage()
+    pdf.save()
+    return buffer.getvalue()
+
+
+@pytest.fixture(scope="module")
+def tabular():
+    doc = parse_document(
+        build_pdf_with_table(), document_id="pdf-table", filename="table.pdf"
+    )
+    assert_spans_hold(doc)
+    return doc
+
+
+def test_a_ruled_table_becomes_a_table_block(tabular) -> None:
+    table = next(b for b in tabular.blocks if b.type is BlockType.TABLE)
+    assert table.table is not None
+    assert table.table.rows[0] == ["Document", "Required", "Retention"]
+    assert table.table.rows[1] == ["Government ID", "Yes", "7 years"]
+    assert table.page == 1
+
+
+def test_the_table_is_rendered_into_the_canonical_text(tabular) -> None:
+    """Otherwise a requirement stated in a table row can never be quoted."""
+    assert "| Government ID | Yes | 7 years |" in tabular.text
+
+
+def test_table_cells_do_not_also_appear_as_loose_paragraphs(tabular) -> None:
+    """The bug this whole geometry pass exists to prevent.
+
+    pdfium's text layer contains the cell text too, so without removing the lines a
+    table's contents appear twice — once structured, once as stray paragraphs — and the
+    document's character count roughly doubles across every table.
+    """
+    paragraphs = [b.text for b in tabular.blocks if b.type is BlockType.PARAGRAPH]
+    assert not any("Government ID" in p for p in paragraphs)
+    assert not any("7 years" in p for p in paragraphs)
+    # And exactly once in the canonical text overall.
+    assert tabular.text.count("Government ID") == 1
+
+
+def test_prose_around_the_table_survives_in_order(tabular) -> None:
+    """A table appended after the prose loses the heading that gave it meaning."""
+    order = [b.type for b in tabular.blocks]
+    types = [t for t in order if t in (BlockType.PARAGRAPH, BlockType.TABLE)]
+    assert types == [BlockType.PARAGRAPH, BlockType.TABLE, BlockType.PARAGRAPH]
+    assert "The table below lists the documents" in tabular.text
+    assert "Retention is measured from the date" in tabular.text
+
+
+def test_a_table_attaches_to_the_heading_above_it(tabular) -> None:
+    table = next(b for b in tabular.blocks if b.type is BlockType.TABLE)
+    assert tabular.heading_path(table.id) == ["Document Requirements"]
+
+
+def test_a_cell_resolves_to_the_table_block(tabular) -> None:
+    from domain.locate import Locator
+
+    result = Locator(tabular).locate("Proof of address")
+    assert result.found
+    block = {b.id: b for b in tabular.blocks}[result.block_id]
+    assert block.type is BlockType.TABLE
+    assert result.page == 1
+
+
+def test_table_extraction_can_be_turned_off(tabular) -> None:
+    """The escape hatch, since this is a second pass over the file.
+
+    With it off the cells survive as text — structure is lost, content is not.
+    """
+    from parse.pdf import PdfParser
+
+    result = PdfParser(extract_tables=False).parse(build_pdf_with_table())
+    assert not [b for b in result.blocks if b.type is BlockType.TABLE]
+    assert any("Government ID" in b.text for b in _walk(result.blocks))
+
+
+def _walk(blocks):
+    for block in blocks:
+        yield block
+        yield from _walk(block.children)
+
+
+# --------------------------------------------------------------------------- #
 # metadata
 # --------------------------------------------------------------------------- #
 
