@@ -7,8 +7,8 @@ API is the only path from a raw upload to document content.
 Full design, including the parts not built yet: [DESIGN.md](DESIGN.md).
 
 ```bash
-pip install -e ".[dev,docx,pdf,xlsx,s3]"
-python -m pytest -q                       # 167 tests, all offline
+pip install -e ".[dev,docx,pdf,xlsx,s3,api,db,kafka]"
+python -m pytest -q                       # 232 tests, all offline
 
 python examples/parse_file.py spec.pdf                        # outline + metadata
 python examples/parse_file.py spec.pdf --text                 # the canonical text
@@ -31,14 +31,28 @@ python examples/parse_file.py "https://...presigned-url..."    # via plain HTTP
 | Quote lookup (`domain/locate.py`) | ✅ |
 | **Fetch from S3, presigned URLs, local — with SSRF guards and size caps** | ✅ |
 | PDF table extraction (ruled tables, de-duplicated from the text flow) | ✅ |
-| OCR backend (pages are detected and flagged; text not yet extracted) | ⬜ |
-| Postgres + S3 persistence, status machine | ⬜ |
-| Kafka intake, retry tiers, DLQ | ⬜ |
-| HTTP API | ⬜ |
+| OCR — pluggable backend, per-page, confidence to the consumer | ✅ |
+| Status machine, run history, idempotent claim | ✅ |
+| Worker: fetch → parse → persist → commit, retry tiers, DLQ | ✅ |
+| Content-addressed artifact store (S3 + local) | ✅ |
+| HTTP API — status, batch, content, text, locate, reprocess, delete | ✅ |
+| Postgres repository + migrations | ⚠️ written, needs a live DB to verify |
+| Kafka/Redpanda adapter | ⚠️ written, needs a broker to verify |
+| Cleanup worker for the delete cascade | ⬜ |
+| Metrics endpoint, tracing | ⬜ |
 
 The parse stage stays pure — bytes in, artifact out, no I/O — which is what lets it be
-tested without infrastructure and what makes job replay safe. Fetching is a separate
-layer (`src/store/`) so that property survives.
+tested without infrastructure and what makes job replay safe. Everything that touches the
+world (`src/store/`, `src/work/`) sits outside it.
+
+**On the two ⚠️ rows.** This was built in an environment with no Postgres server, no Kafka
+broker and no `tesseract` binary, so those three adapters are written but have not been
+executed. What *is* verified is the logic they drive: `InMemoryRepository` is a real
+implementation (its claim is a conditional update, its `start_run` raises on the unique
+key), the worker's ordering and retry routing run against it, and every OCR test runs
+against a fake backend. Run `tests/test_postgres.py` against a live database before trusting the SQL in
+production; `docker-compose.yml` brings up Postgres, Redpanda (Kafka-protocol compatible,
+so the adapter is unchanged) and MinIO for exactly that.
 
 ## The one idea worth knowing
 

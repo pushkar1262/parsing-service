@@ -1,0 +1,89 @@
+# The dependencies this service needs to run for real, so the parts that cannot be
+# tested in-process can be tested at all.
+#
+#   docker compose up -d
+#   PARSING_TEST_DATABASE_URL=postgresql://parsing:parsing@localhost:5432/parsing \
+#       python -m pytest tests/test_postgres.py -q
+#
+# Development only: single node, no auth, no persistence tuning.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: parsing
+      POSTGRES_PASSWORD: parsing
+      POSTGRES_DB: parsing
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U parsing"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+  # Redpanda rather than Kafka. It speaks the Kafka protocol, so `confluent-kafka` and
+  # everything in `src/work/kafka.py` is unchanged — but it is a single binary with no
+  # ZooKeeper and no JVM, which is the difference between a dev stack that starts in two
+  # seconds and one that eats 2 GB before the first document arrives.
+  redpanda:
+    image: redpandadata/redpanda:v24.2.7
+    command:
+      - redpanda
+      - start
+      - --smp=1
+      - --memory=1G
+      - --overprovisioned
+      - --node-id=0
+      - --kafka-addr=internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr=internal://redpanda:9092,external://localhost:19092
+      - --rpc-addr=redpanda:33145
+      - --advertise-rpc-addr=redpanda:33145
+      - --schema-registry-addr=internal://0.0.0.0:8081,external://0.0.0.0:18081
+      - --mode=dev-container
+      # Generous on purpose: partition count cannot be raised later without breaking
+      # per-key ordering for in-flight keys, and per-key ordering is exactly what makes
+      # concurrent processing of one document impossible.
+      - --set=redpanda.default_topic_partitions=24
+    ports:
+      - "19092:19092"   # Kafka API — use localhost:19092 from the host
+      - "18081:18081"   # schema registry
+      - "9644:9644"     # admin API
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -q 'Healthy:.*true'"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - redpanda-data:/var/lib/redpanda/data
+
+  # Topic browser, for watching the retry tiers and the DLQ actually fill up. The most
+  # useful thing here is seeing a document walk 30s → 5m → 30m → dlq.
+  redpanda-console:
+    image: redpandadata/console:v2.7.2
+    depends_on:
+      - redpanda
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_BROKERS: redpanda:9092
+
+  # S3 stand-in, so the fetch and artifact paths can be exercised without AWS.
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: parsing
+      MINIO_ROOT_PASSWORD: parsingparsing
+    volumes:
+      - minio-data:/data
+
+volumes:
+  postgres-data:
+  redpanda-data:
+  minio-data:
