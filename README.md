@@ -51,8 +51,10 @@ executed. What *is* verified is the logic they drive: `InMemoryRepository` is a 
 implementation (its claim is a conditional update, its `start_run` raises on the unique
 key), the worker's ordering and retry routing run against it, and every OCR test runs
 against a fake backend. Run `tests/test_postgres.py` against a live database before trusting the SQL in
-production; `docker-compose.yml` brings up Postgres, Redpanda (Kafka-protocol compatible,
-so the adapter is unchanged) and MinIO for exactly that.
+production; `docker-compose.yml` brings up Postgres and Redpanda (Kafka-protocol
+compatible, so the adapter is unchanged) for exactly that. Blob storage is real S3 — no
+local stand-in — so anything touching an `s3://` reference needs AWS credentials in the
+environment.
 
 ## The one idea worth knowing
 

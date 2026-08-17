@@ -5,6 +5,12 @@
 #   PARSING_TEST_DATABASE_URL=postgresql://parsing:parsing@localhost:5432/parsing \
 #       python -m pytest tests/test_postgres.py -q
 #
+# Blob storage is *not* here: this deployment reads and writes real S3, so the fetch and
+# artifact paths use boto3 against the configured bucket and the worker's IAM role. That
+# means AWS credentials have to be present for anything that touches storage — an
+# `s3://` reference or a real ArtifactStore — while `LocalArtifactStore` and a
+# `FetchPolicy` with `local_roots` keep the tests offline.
+#
 # Development only: single node, no auth, no persistence tuning.
 
 services:
@@ -70,20 +76,6 @@ services:
     environment:
       KAFKA_BROKERS: redpanda:9092
 
-  # S3 stand-in, so the fetch and artifact paths can be exercised without AWS.
-  minio:
-    image: minio/minio:latest
-    command: server /data --console-address ":9001"
-    ports:
-      - "9000:9000"
-      - "9001:9001"
-    environment:
-      MINIO_ROOT_USER: parsing
-      MINIO_ROOT_PASSWORD: parsingparsing
-    volumes:
-      - minio-data:/data
-
 volumes:
   postgres-data:
   redpanda-data:
-  minio-data:
