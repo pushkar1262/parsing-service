@@ -36,6 +36,7 @@ from work.queue import (
     TOPIC_COMPLETED,
     TOPIC_DLQ,
     Job,
+    ParseCompleted,
     Message,
     Publisher,
     next_destination,
@@ -232,15 +233,31 @@ class Worker:
         self._emit("job.succeeded", job, run_id=run.id, **metrics)
 
         if self.publisher is not None:
+            # Built from the outcome, not from the job: the run, the artifact and the
+            # content hash are the reason a consumer subscribes at all, and `tenant_id`
+            # has to survive the hop or the planning service cannot scope its own reads.
+            event = ParseCompleted(
+                document_id=job.document_id,
+                tenant_id=job.tenant_id,
+                run_id=run.id,
+                status=record.status.value,
+                artifact_key=key,
+                content_hash=document.content_hash,
+                occurred_at=record.updated_at,
+                event_id=str(uuid.uuid4()),
+                project_id=job.project_id,
+                reference=job.reference,
+                filename=job.filename,
+                media_type=document.metadata.format or job.media_type,
+                metrics=metrics,
+                trace_id=job.trace_id,
+            )
             self.publisher.publish(
                 Message(
                     topic=TOPIC_COMPLETED,
-                    key=job.document_id,
-                    value=Job(
-                        document_id=job.document_id,
-                        reference=job.reference,
-                        trace_id=job.trace_id,
-                    ).to_bytes(),
+                    key=event.key,
+                    value=event.to_bytes(),
+                    headers=event.headers(),
                 )
             )
 

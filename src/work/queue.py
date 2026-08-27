@@ -25,6 +25,9 @@ TOPIC_COMPLETED = "documents.parse.completed"
 TOPIC_DELETED = "documents.deleted"
 TOPIC_DLQ = "documents.parse.dlq"
 
+# On the envelope and in the body, so a consumer reading either can tell what it has.
+EVENT_PARSE_COMPLETED = "documents.parse.completed"
+
 # Exponential with a cap, as separate topics because Kafka cannot delay a message.
 RETRY_TIERS: tuple[tuple[str, int], ...] = (
     ("documents.parse.retry.30s", 30),
@@ -150,6 +153,72 @@ class Message:
     headers: dict[str, str] = field(default_factory=dict)
 
 
+@dataclass
+class ParseCompleted:
+    """What `documents.parse.completed` carries.
+
+    A separate type from `Job` on purpose. Reusing the job envelope published a *request*
+    shape on a *result* topic: every field a consumer wanted (`run_id`, `artifact_key`,
+    `content_hash`, `status`) was absent, every field it got (`attempt`, `force`,
+    `not_before`, `parse_options`) was meaningless after the fact, and `tenant_id` — the
+    one field the planning service cannot act without — serialised as `null`, because the
+    event was rebuilt from three fields of the job rather than from the outcome.
+
+    `version` is on the wire so a consumer can reject a shape it does not understand
+    instead of silently reading missing fields as `None`, and `event_id` makes the
+    consumer's own idempotency possible without inventing a key from the payload.
+    """
+
+    document_id: str
+    tenant_id: str | None
+    run_id: str
+    status: str
+    artifact_key: str
+    content_hash: str
+    occurred_at: datetime
+    event_id: str
+    project_id: str | None = None
+    reference: str | None = None
+    filename: str | None = None
+    media_type: str | None = None
+    # The same numbers the success log carries — a consumer deciding whether a document
+    # is worth extracting from should not have to call the content API to find out it
+    # extracted 3 characters per page.
+    metrics: dict[str, Any] = field(default_factory=dict)
+    trace_id: str | None = None
+    version: int = 1
+
+    @property
+    def key(self) -> str:
+        """Partitioned by document, like every other topic here."""
+        return self.document_id
+
+    def headers(self) -> dict[str, str]:
+        """Type and trace on the envelope, so a consumer can route and correlate without
+        deserialising the body."""
+        headers = {"event_type": EVENT_PARSE_COMPLETED, "event_version": str(self.version)}
+        if self.trace_id:
+            headers["trace_id"] = self.trace_id
+        return headers
+
+    def to_bytes(self) -> bytes:
+        payload = asdict(self)
+        payload["event_type"] = EVENT_PARSE_COMPLETED
+        payload["occurred_at"] = self.occurred_at.isoformat()
+        return json.dumps(payload).encode("utf-8")
+
+    @classmethod
+    def from_bytes(cls, raw: bytes) -> ParseCompleted:
+        payload = json.loads(raw.decode("utf-8"))
+        payload.pop("event_type", None)
+        if isinstance(payload.get("occurred_at"), str):
+            payload["occurred_at"] = datetime.fromisoformat(payload["occurred_at"])
+        # Forward compatibility, as with `Job`: a producer adding a field must not stop
+        # this consumer.
+        known = {f.name for f in fields(cls)}
+        return cls(**{k: v for k, v in payload.items() if k in known})
+
+
 @runtime_checkable
 class Publisher(Protocol):
     def publish(self, message: Message) -> None: ...
@@ -197,6 +266,10 @@ class InMemoryQueue:
 
     def jobs_in(self, topic: str) -> list[Job]:
         return [Job.from_bytes(m.value) for m in self.topics.get(topic, [])]
+
+    def events_in(self, topic: str) -> list[ParseCompleted]:
+        """`jobs_in` for the completion topic, which does not carry jobs."""
+        return [ParseCompleted.from_bytes(m.value) for m in self.topics.get(topic, [])]
 
     def count(self, topic: str) -> int:
         return len(self.topics.get(topic, []))

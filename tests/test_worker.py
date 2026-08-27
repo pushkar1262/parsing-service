@@ -8,6 +8,7 @@ answers have to be the same whether the duplicate is a millisecond or a day late
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -23,7 +24,14 @@ from domain.status import DocumentStatus, RunStatus
 from store.artifacts import LocalArtifactStore
 from store.blobs import FetchPolicy, Storage
 from store.repository import DuplicateRun, InMemoryRepository
-from work.queue import RETRY_TIERS, TOPIC_COMPLETED, TOPIC_DLQ, InMemoryQueue, Job
+from work.queue import (
+    EVENT_PARSE_COMPLETED,
+    RETRY_TIERS,
+    TOPIC_COMPLETED,
+    TOPIC_DLQ,
+    InMemoryQueue,
+    Job,
+)
 from work.worker import Disposition, Worker
 
 SPEC = b"""# Merchant Onboarding
@@ -130,7 +138,46 @@ def test_the_linkage_back_to_the_raw_file_survives_in_the_artifact(env) -> None:
 def test_a_completion_event_is_published_so_consumers_need_not_poll(env) -> None:
     env["worker"].process(env["job"])
     assert env["queue"].count(TOPIC_COMPLETED) == 1
-    assert env["queue"].jobs_in(TOPIC_COMPLETED)[0].document_id == "doc-1"
+    assert env["queue"].events_in(TOPIC_COMPLETED)[0].document_id == "doc-1"
+
+
+def test_the_completion_event_carries_the_outcome_and_not_the_request(env) -> None:
+    """The event exists so a consumer can act on it without calling back.
+
+    It was previously a re-serialised `Job`, which meant it named the document and
+    nothing else: no run, no artifact, no content hash, and a `tenant_id` of `null`
+    even when the job had one. Every consumer had to poll the status API anyway,
+    which is exactly what the event was added to avoid.
+    """
+    job = replace(env["job"], tenant_id="tenant-a", project_id="proj-1")
+    outcome = env["worker"].process(job)
+
+    event = env["queue"].events_in(TOPIC_COMPLETED)[0]
+    record = env["repository"].get("doc-1")
+    assert event.tenant_id == "tenant-a"
+    assert event.project_id == "proj-1"
+    assert event.run_id == outcome.run_id
+    assert event.status == record.status.value == "ready"
+    assert event.artifact_key == outcome.artifact_key
+    assert event.content_hash == record.content_hash
+    assert event.metrics["chars"] > 0
+    assert event.occurred_at == record.updated_at
+    assert event.event_id
+
+
+def test_the_completion_envelope_names_its_type_and_survives_a_round_trip(env) -> None:
+    """Type and version on the headers, so a consumer can route without parsing."""
+    env["worker"].process(replace(env["job"], trace_id="trace-9"))
+
+    message = env["queue"].topics[TOPIC_COMPLETED][0]
+    assert message.key == "doc-1"
+    assert message.headers["event_type"] == EVENT_PARSE_COMPLETED
+    assert message.headers["event_version"] == "1"
+    assert message.headers["trace_id"] == "trace-9"
+
+    decoded = env["queue"].events_in(TOPIC_COMPLETED)[0]
+    assert decoded.version == 1
+    assert decoded.trace_id == "trace-9"
 
 
 def test_success_metrics_include_the_silent_failure_detector(env) -> None:

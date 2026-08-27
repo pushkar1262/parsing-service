@@ -544,6 +544,29 @@ mechanics, where the text lives.
 instead of poll. The status API stays as the source of truth and the fallback;
 the event just removes polling latency for the common path.
 
+It carries the *outcome*, not the request — `run_id`, `artifact_key`,
+`content_hash`, `status`, `tenant_id` and the success metrics — with
+`event_type`, `event_version` and `trace_id` on the Kafka headers so a consumer
+can route and correlate without deserialising the body:
+
+```json
+{
+  "event_type": "documents.parse.completed", "version": 1,
+  "event_id": "…", "occurred_at": "2026-08-27T09:14:02.118+00:00",
+  "document_id": "…", "tenant_id": "…", "project_id": "…",
+  "run_id": "…", "status": "ready",
+  "artifact_key": "parsed/<content_hash>/1.0/document.json",
+  "content_hash": "…", "reference": "s3://…", "filename": "spec.pdf",
+  "media_type": "pdf", "metrics": {"chars": 8412, "chars_per_page": 701.0, "…": "…"},
+  "trace_id": "…"
+}
+```
+
+Publishing the job envelope here instead is a trap worth naming: it type-checks,
+it looks like an event, and it forces every consumer back onto the status API —
+while serialising `tenant_id` as `null` and shipping `attempt`, `force` and
+`not_before`, none of which mean anything once the work is done.
+
 ---
 
 ## 8. Deletion
