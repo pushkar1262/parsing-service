@@ -545,9 +545,10 @@ instead of poll. The status API stays as the source of truth and the fallback;
 the event just removes polling latency for the common path.
 
 It carries the *outcome*, not the request — `run_id`, `artifact_key`,
-`content_hash`, `status`, `tenant_id` and the success metrics — with
-`event_type`, `event_version` and `trace_id` on the Kafka headers so a consumer
-can route and correlate without deserialising the body:
+`content_hash`, `status`, `tenant_id`, the success metrics, and the document's own
+`metadata` and `warnings` — with `event_type`, `event_version` and `trace_id` on
+the Kafka headers so a consumer can route and correlate without deserialising the
+body:
 
 ```json
 {
@@ -558,6 +559,8 @@ can route and correlate without deserialising the body:
   "artifact_key": "parsed/<content_hash>/1.0/document.json",
   "content_hash": "…", "reference": "s3://…", "filename": "spec.pdf",
   "media_type": "pdf", "metrics": {"chars": 8412, "chars_per_page": 701.0, "…": "…"},
+  "metadata": {"format": "pdf", "page_count": 12, "word_count": 1408, "char_count": 8412, "…": "…"},
+  "warnings": [{"code": "blank_page", "message": "page 7 contains nothing", "page": 7, "block_id": null}],
   "trace_id": "…"
 }
 ```
@@ -566,6 +569,13 @@ Publishing the job envelope here instead is a trap worth naming: it type-checks,
 it looks like an event, and it forces every consumer back onto the status API —
 while serialising `tenant_id` as `null` and shipping `attempt`, `force` and
 `not_before`, none of which mean anything once the work is done.
+
+`metadata` is separate from `metrics` for the same reason and was added after the
+same mistake in miniature. `metrics` is the success log's summary: it renames
+`page_count` to `pages`, `char_count` to `chars`, and drops `word_count`. A
+consumer storing "what the parser said about this document" needs the object the
+artifact carries, under the names it carries them, so `metadata` ships verbatim
+and `metrics` stays what it always was — the numbers worth reading in a log line.
 
 ---
 

@@ -180,6 +180,57 @@ def test_the_completion_envelope_names_its_type_and_survives_a_round_trip(env) -
     assert decoded.trace_id == "trace-9"
 
 
+def test_the_completion_event_carries_the_document_metadata_consumers_store(env) -> None:
+    """`metrics` is the log's summary; `metadata` is what a consumer keeps.
+
+    Shipping only `metrics` was a real bug with a silent failure mode. A consumer
+    storing "what the parser said about this document" looks for `page_count`,
+    `word_count` and `char_count`; `metrics` spells the first two `pages` and
+    `chars` and omits the third entirely, so a strict reader found none of them,
+    stored an empty object, and showed a parsed document with no format, no page
+    count and no word count — with nothing anywhere reporting an error.
+    """
+    env["worker"].process(env["job"])
+    event = env["queue"].events_in(TOPIC_COMPLETED)[0]
+
+    artifact = env["artifacts"].get(event.artifact_key)
+    assert event.metadata == artifact.metadata.model_dump(mode="json"), (
+        "the event must carry the same description the artifact does"
+    )
+    # The three names that were missing, under the names a consumer looks for.
+    assert event.metadata["format"] == "markdown"
+    assert event.metadata["word_count"] > 0
+    assert event.metadata["char_count"] > 0
+    # And `metrics` is untouched: it is the success log's summary and something
+    # already reads it.
+    assert event.metrics["chars"] == event.metadata["char_count"]
+
+
+def test_the_completion_event_carries_whole_warnings_not_just_their_codes(env) -> None:
+    """A warning is a code, a message and a page. The count alone is a badge; the
+    message is what tells someone WHY an extraction came back thin.
+
+    Parsed from bytes that actually warn, because a document with no warnings would
+    pass this test against an empty list and prove nothing.
+    """
+    # 0x80 is a euro sign in cp1252 and not valid UTF-8 at all, so decode() falls
+    # through to guessing and records `encoding_guessed`.
+    (env["inbox"] / "legacy.md").write_bytes(b"# Spec\n\nPrice is 50\x80 before rebate.\n")
+    job = replace(env["job"], reference=str(env["inbox"] / "legacy.md"))
+    env["worker"].process(job)
+    event = env["queue"].events_in(TOPIC_COMPLETED)[0]
+
+    artifact = env["artifacts"].get(event.artifact_key)
+    assert event.warnings, "this document warns; the event must carry it"
+    assert event.warnings == [w.model_dump(mode="json") for w in artifact.warnings]
+    assert len(event.warnings) == len(event.metrics["warnings"]), (
+        "the two lists describe the same warnings and must not drift"
+    )
+    for warning in event.warnings:
+        assert set(warning) >= {"code", "message"}
+        assert warning["message"], "a code with no message is the half a consumer has"
+
+
 def test_success_metrics_include_the_silent_failure_detector(env) -> None:
     """`chars_per_page` is the number that catches a PDF with a broken font map.
 

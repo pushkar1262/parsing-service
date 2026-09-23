@@ -250,6 +250,10 @@ class Worker:
                 filename=job.filename,
                 media_type=document.metadata.format or job.media_type,
                 metrics=metrics,
+                # The same object written to the run row above, so a consumer storing
+                # it holds what the status API would have told it.
+                metadata=document.metadata.model_dump(mode="json"),
+                warnings=[w.model_dump(mode="json") for w in document.warnings],
                 trace_id=job.trace_id,
             )
             self.publisher.publish(

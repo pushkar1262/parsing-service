@@ -185,6 +185,21 @@ class ParseCompleted:
     # is worth extracting from should not have to call the content API to find out it
     # extracted 3 characters per page.
     metrics: dict[str, Any] = field(default_factory=dict)
+    # The document's full description — `format`, `page_count`, `word_count`,
+    # `char_count`, `title`, the parser's name and version — exactly as the artifact
+    # and the status API carry it.
+    #
+    # `metrics` above is NOT a substitute, and shipping only it was a real bug: it is
+    # the success log's summary, it renames `page_count` to `pages` and `char_count`
+    # to `chars`, and it drops `word_count` altogether. A consumer that stores the
+    # document's metadata — the planning side does, to show a parsed row without a
+    # second call — found none of the fields it was looking for and stored an empty
+    # object instead.
+    metadata: dict[str, Any] = field(default_factory=dict)
+    # The warnings themselves, `{code, message, page, block_id}` each, rather than the
+    # bare codes `metrics` carries. Bounded by the document: one per unreadable or
+    # blank page at worst.
+    warnings: list[dict[str, Any]] = field(default_factory=list)
     trace_id: str | None = None
     version: int = 1
 
